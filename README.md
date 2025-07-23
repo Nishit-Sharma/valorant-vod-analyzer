@@ -15,7 +15,6 @@ The core vision is to transform noisy, unstructured video data into structured, 
 
 VOD-Net is composed of four main systems:
 
-![VOD-Net Architecture](https.placeholder.com/architecture.png)  <!-- Placeholder for a real diagram -->
 
 1.  **The Ingestion & Processing Pipeline (The "ETL" Layer):**
     *   **Video Source:** Ingests VODs from various sources (e.g., local files, YouTube links).
