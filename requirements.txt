@@ -6,6 +6,9 @@ opencv-python
 torch
 torchvision
 ultralytics
+pytesseract
+pillow
+shapely
 
 # API & Server
 fastapi

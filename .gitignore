@@ -1,3 +1,11 @@
 ffmpeg.exe
 ffplay.exe
 ffprobe.exe
+/data/*
+/*/__pycache__/*
+/__pycache__/*
+/reports/*
+/visualizations/*
+strip_model.py
+.vscode/*
+optimized.pt
