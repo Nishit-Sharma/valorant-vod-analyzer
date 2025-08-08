@@ -3,22 +3,23 @@ import cv2
 import argparse
 import os
 import random
+import numpy as np
 from shapely.geometry import Polygon, Point
 
 COLOR = {
-    "A Site": (0, 255, 0),  # Green
-    "B Site": (0, 0, 255),  # Red
-    "A Main": (0, 255, 255),  # Yellow
-    "B Main": (255, 255, 0),  # Cyan
-    "T Spawn": (255, 0, 255),  # Magenta
-    "CT Spawn": (255, 0, 0),  # Red
-    "Mid 1": (0, 255, 0),  # Green
-    "Mid 2": (0, 0, 255),  # Red
-    "Mid 3": (255, 255, 0),  # Cyan
+    "A Site": (255, 0, 0),  # Red
+    "B Site": (255, 165, 0),  # Orange
+    "A Main": (255, 255, 0),  # Yellow
+    "B Main": (0, 255, 0),  # Green
+    "T Spawn": (0, 0, 255),  # Blue
+    "CT Spawn": (255, 0, 255),  # Purple
+    "Mid 1": (0, 255, 255),  # Cyan
+    "Mid 2": (255, 255, 255),  # White
+    "Mid 3": (255, 192, 203),  # Pink
     "Garden": (255, 0, 255),  # Magenta
-    "Tree": (255, 0, 0),  # Red
-    "A Heaven": (0, 255, 0),  # Green
-    "Market": (0, 0, 255),  # Red
+    "Tree": (0, 0, 0),  # Black
+    "A Heaven": (50, 205, 50),  # Lime
+    "Market": (64, 224, 208),  # Turquoise
     "Unknown": (200, 200, 200)
 }
 
@@ -83,5 +84,4 @@ def main():
     print(f"Overlay saved to {args.out}")
 
 if __name__ == "__main__":
-    import numpy as np
     main()

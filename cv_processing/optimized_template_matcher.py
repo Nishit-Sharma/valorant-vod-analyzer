@@ -55,7 +55,7 @@ class OptimizedTemplateManager:
         gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
         
         # Store multiple scales to avoid runtime scaling
-        scales = [0.8, 0.9, 1.0, 1.1, 1.2]
+        scales = [0.6, 0.75, 0.9, 1.0, 1.1, 1.25]
         scaled_templates = {}
         
         for scale in scales:
@@ -119,10 +119,10 @@ class OptimizedValorantTemplateDetector:
         
         # Optimized ROI configurations
         self.roi_configs = {
-            'kill_feed': {'x': 0.6, 'y': 0.1, 'w': 0.38, 'h': 0.4},
-            'scoreboard': {'x': 0.4, 'y': 0.0, 'w': 0.2, 'h': 0.1},
+            'kill_feed': {'x': 0.60, 'y': 0.08, 'w': 0.38, 'h': 0.44},
+            'scoreboard': {'x': 0.25, 'y': 0.0, 'w': 0.50, 'h': 0.12},
             'minimap': {'x': 0.0, 'y': 0.0, 'w': 0.25, 'h': 0.25},
-            'abilities': {'x': 0.35, 'y': 0.85, 'w': 0.3, 'h': 0.15},
+            'abilities': {'x': 0.30, 'y': 0.80, 'w': 0.40, 'h': 0.20},
             'full_screen': {'x': 0.0, 'y': 0.0, 'w': 1.0, 'h': 1.0}
         }
         

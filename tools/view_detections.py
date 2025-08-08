@@ -14,7 +14,7 @@ def list_visualization_directories():
     viz_base = "visualizations"
     if not os.path.exists(viz_base):
         print("❌ No visualizations directory found")
-        print("   Run analysis with visualizations first: python hybrid_main.py --video_path video.mp4")
+        print("   Run analysis with visualizations first: python main.py --video_path video.mp4")
         return []
     
     dirs = [d for d in os.listdir(viz_base) if os.path.isdir(os.path.join(viz_base, d))]
@@ -34,17 +34,20 @@ def show_detection_summary(viz_dir: str):
     for i, img_path in enumerate(sorted(image_files), 1):
         filename = os.path.basename(img_path)
         
-        # Parse filename: detection_001_t156s_conf0.88.jpg
+        # Parse filename variants:
+        #  - frame_001_t156s_dets10_conf0.88.jpg (current)
+        #  - detection_001_t156s_conf0.88.jpg (legacy)
         parts = filename.replace('.jpg', '').split('_')
-        if len(parts) >= 4:
-            detection_num = parts[1]
-            timestamp = parts[2].replace('t', '').replace('s', '')
-            confidence = parts[3].replace('conf', '')
-            
-            print(f"  {i:2d}. {filename}")
-            print(f"      ⏰ Time: {timestamp}s | 🎯 Confidence: {confidence}")
-        else:
-            print(f"  {i:2d}. {filename}")
+        timestamp = None
+        confidence = None
+        for p in parts:
+            if p.startswith('t') and p.endswith('s'):
+                timestamp = p[1:-1]
+            if p.startswith('conf'):
+                confidence = p.replace('conf', '')
+        print(f"  {i:2d}. {filename}")
+        if timestamp or confidence:
+            print(f"      ⏰ Time: {timestamp or '?'}s | 🎯 Confidence: {confidence or '?'}")
     
     print(f"\n📁 Full path: {viz_dir}")
     print(f"📖 Open the images above to see what your model detected!")

@@ -1,430 +1,422 @@
-import json
-import os
 import argparse
 import glob
+import json
+import os
 from collections import defaultdict
+from typing import Dict, List, Tuple
+
 import numpy as np
-from typing import List, Dict
 from shapely.geometry import Point, Polygon
 
+# ---------------------------------------------------------------------------
 # Configuration
-REPORTS_DIR = "reports/"
-SITE_MASK_DIR = "site_masks"
+# ---------------------------------------------------------------------------
+REPORTS_DIR = os.path.join("data", "reports")  # legacy fallback
+SITE_MASK_DIR = os.path.join("data", "site_masks")
 
-# Will be filled at runtime
-SITE_POLYGONS = {}  # canonical_key -> list[Polygon]
+
+# ---------------------------------------------------------------------------
+# Polygon helpers
+# ---------------------------------------------------------------------------
+SITE_POLYGONS: Dict[str, List[Polygon]] = {}
+
 
 def _canonical_site(name: str) -> str:
-    """Map various region names to canonical keys used by summaries."""
-    lower = name.lower()
-    if 'mid' in lower:
-        return 'Middle'
-    if 'garden' in lower:
-        return 'Garden'
-    if 'tree' in lower:
-        return 'Tree'
-    if 'a heaven' in lower:
-        return 'A Heaven'
-    if 'market' in lower:
-        return 'Market'
-    if 't spawn' in lower:
-        return 'T Spawn'
-    if 'ct spawn' in lower:
-        return 'CT Spawn'
-    if 'mid 1' in lower:
-        return 'Mid 1'
-    if 'mid 2' in lower:
-        return 'Mid 2'
-    if 'mid 3' in lower:
-        return 'Mid 3'
-    if 'a site' in lower:
-        return 'A Site'
-    if 'b site' in lower:
-        return 'B Site'
-    if 'a main' in lower:
-        return 'A Main'
-    if 'b main' in lower:
-        return 'B Main'
-    return 'Unknown'
-SITE_POLYGONS = {}
-
-BOMB_SITE_AREAS_LEGACY = {
-    # Ranges are defined on the 640x640 minimap crop.
-    # We broaden Y so that vertical position doesn’t accidentally mark a location as unknown.
-    "A": {"x_range": (410, 640)},   # Right ~35%
-    "B": {"x_range": (0, 230)},    # Left ~35%
-    "Middle": {"x_range": (230, 410)}  # Central strip
-}
-
-TIME_BINS = {
-    "early_round": (0, 30000),      # 0-30s
-    "mid_round":   (30000, 60000),   # 30-60s
-    "late_round":  (60000, 120000)  # 60-120s
-}
-
-# --- New Constants ---
-# If the time gap between two consecutive events exceeds this threshold, we assume a new round has begun.
-# Valorant round length (including buy phase) is ~90-120s, so a 2-minute gap is a safe upper-bound.
-ROUND_GAP_THRESHOLD_MS = 15_000  # 15 seconds
+    n = (name or "").lower()
+    if "a site" in n:
+        return "A Site"
+    if "b site" in n:
+        return "B Site"
+    if "a main" in n:
+        return "A Main"
+    if "b main" in n:
+        return "B Main"
+    if "a heaven" in n:
+        return "A Heaven"
+    if "ct spawn" in n:
+        return "CT Spawn"
+    if "t spawn" in n:
+        return "T Spawn"
+    if "mid 1" in n:
+        return "Mid 1"
+    if "mid 2" in n:
+        return "Mid 2"
+    if "mid 3" in n:
+        return "Mid 3"
+    if "market" in n:
+        return "Market"
+    if "tree" in n:
+        return "Tree"
+    if "garden" in n:
+        return "Garden"
+    if "mid" in n:
+        return "Middle"
+    return name
 
 
-# --- Helper: Segment events into rounds ---
-# Optional fallback maximum round length (disabled by default)
-MAX_ROUND_LENGTH_MS = None  # Set e.g. 110_000 to re-enable fixed slicing
+def load_site_polygons(map_name: str) -> None:
+    global SITE_POLYGONS
+    SITE_POLYGONS = {}
+    mask_path = os.path.join(SITE_MASK_DIR, f"{map_name}.json")
+    if not os.path.exists(mask_path):
+        print(f"⚠️  Site mask for {map_name} not found. Locations will be 'Unknown'.")
+        return
+    with open(mask_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    for orig, pts in raw.items():
+        canon = _canonical_site(orig)
+        try:
+            SITE_POLYGONS.setdefault(canon, []).append(Polygon(pts).buffer(1.5))
+        except Exception:
+            continue
+    # Avoid unicode checkmark in Windows CP1252 environments
+    print(f"Loaded site mask for {map_name} with {sum(len(v) for v in SITE_POLYGONS.values())} polygons.")
 
 
-def segment_events_into_rounds(events: List[Dict], gap_threshold_ms: int = ROUND_GAP_THRESHOLD_MS, max_round_length_ms: int = MAX_ROUND_LENGTH_MS):
-    """Segment the global event list into round chunks.
+def loc_from_point(x: float, y: float) -> str:
+    if not SITE_POLYGONS:
+        return "Unknown"
+    p = Point(x, y)
+    for name, polys in SITE_POLYGONS.items():
+        for poly in polys:
+            try:
+                if poly.contains(p):
+                    return name
+            except Exception:
+                pass
+    return "Unknown"
 
-    Priority order for round segmentation:
-    1. Use explicit `round_start` (or `buy_phase_start`) markers if present.
-    2. Fallback to a time-gap heuristic when no markers are available.
 
-    Notes:
-        • The function is backward-compatible – if neither markers nor large gaps
-          exist, it simply returns a single round spanning the whole match.
-    """
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
+def get_time_bin_ms(rel_ms: int) -> str:
+    if rel_ms < 30_000:
+        return "early_round"
+    if rel_ms < 60_000:
+        return "mid_round"
+    return "late_round"
 
+
+# ---------------------------------------------------------------------------
+# Round segmentation (robust)
+# ---------------------------------------------------------------------------
+def _explicit_round_boundaries(events: List[Dict]) -> List[Tuple[int, int]]:
+    bounds = []  # (ts, round_number or -1)
+    for e in events:
+        if e.get("event_type") == "round_start":
+            rn = e.get("details", {}).get("round_number")
+            ts = int(e.get("timestamp_ms", 0))
+            bounds.append((ts, int(rn) if isinstance(rn, int) else -1))
+    return sorted(set(bounds))
+
+
+def _gap_boundaries(events: List[Dict]) -> List[int]:
+    if len(events) < 2:
+        return [0]
+    ts = [int(e["timestamp_ms"]) for e in events]
+    ts.sort()
+    diffs = [b - a for a, b in zip(ts[:-1], ts[1:])]
+    if not diffs:
+        return [0]
+    median = float(np.median(diffs))
+    p95 = float(np.percentile(diffs, 95))
+    threshold = max(15_000, int(max(p95, 20 * median)))
+    cuts = [0]
+    for a, b in zip(ts[:-1], ts[1:]):
+        if b - a > threshold:
+            cuts.append(b)
+    return sorted(set(cuts))
+
+
+def _plant_boundaries(events: List[Dict]) -> List[int]:
+    plants = [int(e["timestamp_ms"]) for e in events if e.get("event_type") == "spike_planted"]
+    plants.sort()
+    bounds = []
+    prev = None
+    for t in plants:
+        if prev is None or t - prev > 45_000:
+            bounds.append(max(0, t - 25_000))  # start ~25s before plant
+            prev = t
+    return bounds
+
+
+def segment_events_into_rounds(events: List[Dict]) -> List[Dict]:
     if not events:
         return []
+    def to_ts(ev):
+        try:
+            return int(ev.get("timestamp_ms", 0))
+        except Exception:
+            return 0
+    events_sorted = sorted(events, key=to_ts)
 
-    # Ensure chronological order
-    events_sorted = sorted(events, key=lambda e: e["timestamp_ms"])
+    explicit = _explicit_round_boundaries(events_sorted)
+    if len(explicit) >= 2:
+        # Use explicit boundaries
+        starts = [ts for ts, _ in explicit]
+    else:
+        # Blend gaps and plants, then clean
+        starts = _gap_boundaries(events_sorted) + _plant_boundaries(events_sorted)
+    starts = sorted(set(starts))
+    if not starts or starts[0] != 0:
+        starts = [0] + starts
 
-    # 1. Collect explicit round-start indices if available
-    round_start_indices = [0]  # first event implicitly starts round 1
-    for idx, evt in enumerate(events_sorted):
-        evt_type = evt.get("event_type", "")
-        if evt_type in {"round_start", "buy_phase_start"}:
-            round_start_indices.append(idx)
-
-    # Remove duplicates / keep sorted unique indices
-    round_start_indices = sorted(set(round_start_indices))
-
-    # 2. If no explicit markers, build them using gap heuristic
-    if len(round_start_indices) == 1:  # only implicit first index
-        for prev_idx, curr_idx in zip(range(len(events_sorted) - 1), range(1, len(events_sorted))):
-            prev_ts = events_sorted[prev_idx]["timestamp_ms"]
-            curr_ts = events_sorted[curr_idx]["timestamp_ms"]
-            if curr_ts - prev_ts > gap_threshold_ms:
-                round_start_indices.append(curr_idx)
-
-        round_start_indices = sorted(set(round_start_indices))
-
-    # 2b. Fallback: split by fixed round length if still only one round detected
-    if len(round_start_indices) == 1 and max_round_length_ms:
-        current_start_idx = 0
-        start_ts = events_sorted[0]["timestamp_ms"]
-        for idx, evt in enumerate(events_sorted):
-            if evt["timestamp_ms"] - start_ts >= max_round_length_ms:
-                round_start_indices.append(idx)
-                start_ts = evt["timestamp_ms"]
-        round_start_indices = sorted(set(round_start_indices))
-
-    # 3. Build round slices using the collected indices
-    rounds = []
-    for i, start_idx in enumerate(round_start_indices):
-        end_idx = round_start_indices[i + 1] if i + 1 < len(round_start_indices) else len(events_sorted)
-        slice_events = events_sorted[start_idx:end_idx]
+    rounds: List[Dict] = []
+    for i, s in enumerate(starts):
+        e = starts[i + 1] if i + 1 < len(starts) else None
+        slice_events = [ev for ev in events_sorted if ev["timestamp_ms"] >= s and (e is None or ev["timestamp_ms"] < e)]
+        if not slice_events:
+            continue
         rounds.append({
-            "round": i + 1,
+            "round": (explicit[i][1] if i < len(explicit) and explicit[i][1] > 0 else i + 1),
             "start_ts": slice_events[0]["timestamp_ms"],
             "end_ts": slice_events[-1]["timestamp_ms"],
             "events": slice_events,
         })
-
-    return rounds
-
-def load_site_polygons(map_name: str):
-    """Load polygon masks for a given map into SITE_POLYGONS global."""
-    global SITE_POLYGONS
-    mask_path = os.path.join(SITE_MASK_DIR, f"{map_name}.json")
-    if not os.path.exists(mask_path):
-        print(f"⚠️  Site mask for {map_name} not found – falling back to legacy X-bands.")
-        SITE_POLYGONS = {}
-        return
-    with open(mask_path, "r") as f:
-        raw = json.load(f)
-    SITE_POLYGONS = {}
-    BUFFER = 1.5  # grow polygons by ~1 px to cover border cases
-    for orig, pts in raw.items():
-        canon = _canonical_site(orig)
-        SITE_POLYGONS.setdefault(canon, []).append(Polygon(pts).buffer(BUFFER))
-    print(f"✅ Loaded site mask for {map_name}: {list(SITE_POLYGONS.keys())}")
+    # Merge tiny slices that are clearly replays/cutaways (< 10s with < 10 detections)
+    merged: List[Dict] = []
+    for r in rounds:
+        duration = r["end_ts"] - r["start_ts"]
+        detections = sum(1 for e in r["events"] if e.get("event_type") == "agent_detection")
+        if merged and duration < 10_000 and detections < 10:
+            merged[-1]["events"].extend(r["events"])
+            merged[-1]["end_ts"] = r["end_ts"]
+        else:
+            merged.append(r)
+    # Re-number sequentially if explicit labels are missing or messy
+    for i, r in enumerate(merged, 1):
+        if not isinstance(r.get("round"), int) or r["round"] <= 0:
+            r["round"] = i
+    return merged
 
 
-def get_location_name(x, y):
-    """Determine site name from minimap coords using loaded polygons."""
-    if SITE_POLYGONS:
-        p = Point(x, y)
-        for canon, poly_list in SITE_POLYGONS.items():
-            for poly in poly_list:
-                if poly.contains(p):
-                    return canon
-        return "Unknown"
-    # No match
-    return "Unknown"
+# ---------------------------------------------------------------------------
+# Position analysis and summaries
+# ---------------------------------------------------------------------------
+def _events_by_ts(events: List[Dict]) -> Dict[int, List[Dict]]:
+    by = defaultdict(list)
+    for e in events:
+        if e.get("event_type") == "agent_detection":
+            by[int(e["timestamp_ms"])].append(e)
+    return by
 
-def get_time_bin(timestamp_ms):
-    """Get the time bin for a given timestamp."""
-    for bin_name, time_range in TIME_BINS.items():
-        if time_range[0] <= timestamp_ms < time_range[1]:
-            return bin_name
-    return "unknown"
 
-def analyze_positions(events):
-    """Analyze player positions round-by-round to find patterns.
+def _location_of_team(frame_events: List[Dict], team_label: str) -> str:
+    pts = [
+        (ev["details"].get("center_x"), ev["details"].get("center_y"))
+        for ev in frame_events
+        if team_label in ev.get("details", {}).get("class_name", "")
+           and ev.get("details") is not None
+           and ev["details"].get("center_x") is not None
+           and ev["details"].get("center_y") is not None
+    ]
+    if not pts:
+        return ""
+    avg_x = float(np.mean([p[0] for p in pts]))
+    avg_y = float(np.mean([p[1] for p in pts]))
+    return loc_from_point(avg_x, avg_y)
 
-    The resulting data structure is compatible with the previous implementation:
-    {
-        "early_round": {"Middle": ["A", ...], ...},
-        "mid_round":   {...},
-        "late_round":  {...}
-    }
-    """
 
-    # Nested dict: {team_side: {time_bin: {location: [final_destinations]}}}
-    position_patterns = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-
-    # --- 1. Segment events into rounds ---
-    rounds = segment_events_into_rounds(events)
-
-    if not rounds:
-        return {}
-
-    # --- 2. Process each round independently ---
-    for rnd in rounds:
-        round_events = rnd["events"]
-
-        # Determine half (1 or 2) based on round number (Valorant swaps after 12 rounds)
-        half_idx = 1 if rnd["round"] <= 12 else 2
-        # Map teams to sides for this half. Enemy attacks first half, defends second half.
-        side_for_team = {
-            "Enemy": "Attackers" if half_idx == 1 else "Defenders",
-            "Ally": "Defenders" if half_idx == 1 else "Attackers"
-        }
-
-        # Build mapping ts -> events for quick lookup
-        events_by_ts = defaultdict(list)
-        for evt in round_events:
-            if evt.get("event_type") == "agent_detection":
-                events_by_ts[evt["timestamp_ms"]].append(evt)
-
-        if not events_by_ts:
-            continue
-
-        # Determine final destination of the round (last timestamp with agent detections)
-        final_ts = max(events_by_ts.keys())
-        final_locations = [
-            get_location_name(e['details']['center_x'], e['details']['center_y'])
-            for e in events_by_ts[final_ts]
-        ]
-        valid_final_locations = [loc for loc in final_locations if loc]
-        final_destination = (
-            max(set(valid_final_locations), key=valid_final_locations.count)
-            if valid_final_locations else "Unknown"
-        )
-
-        # Analyze positions within this round
-        round_start_ts = rnd["start_ts"]
-        for ts, frame_events in events_by_ts.items():
-            rel_time = ts - round_start_ts  # milliseconds since round start
-            time_bin = get_time_bin(rel_time)
-
-            # Collect positions per team ('Enemy' and 'Ally')
-            for team_label in ["Enemy", "Ally"]:
-                team_positions = [
-                    (e['details']['center_x'], e['details']['center_y'])
-                    for e in frame_events if team_label in e['details']['class_name']
-                ]
-
-                if not team_positions:
+def _top_locations(frames: List[List[Dict]], team_label: str, max_items: int = 2, min_conf: float = 0.6) -> str:
+    if not frames:
+        return "unknown"
+    counts: Dict[str, int] = {}
+    total = 0
+    for fe in frames:
+        loc = _location_of_team(fe, team_label)
+        if not loc:
                     continue
+        counts[loc] = counts.get(loc, 0) + 1
+        total += 1
+    if total == 0:
+        return "unknown"
+    # Sort by frequency
+    items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+    top_name, top_count = items[0]
+    conf = top_count / total
+    if conf >= min_conf:
+        return top_name
+    # Otherwise list up to two top locations
+    names = [n for n, _ in items[:max_items]]
+    return " and ".join(names) if names else "spread out"
 
-                avg_x = np.mean([p[0] for p in team_positions])
-                avg_y = np.mean([p[1] for p in team_positions])
-
-                location_name = get_location_name(avg_x, avg_y)
-
-                if location_name:
-                    team_side_key = f"{team_label}-{side_for_team[team_label]}"
-                    position_patterns[team_side_key][time_bin][location_name].append(final_destination)
-
-    return position_patterns
-
-# --------------------------------------------------
-# New: Per-Round Narrative Summary
-# --------------------------------------------------
 
 def summarize_rounds(events: List[Dict]) -> List[str]:
-    """Create a human-readable narrative of each round.
-
-    Example output (one item per list index):
-        "Round 1: Early round – Attackers in Middle, Defenders spread out; Mid round – Attackers stacked towards A, Defenders towards A; Late round – Attackers in A, Defenders in A. Spike likely planted at A."
-    """
-
     rounds = segment_events_into_rounds(events)
-    if not rounds:
-        return []
+    out: List[str] = []
+    for r in rounds:
+        by_ts = _events_by_ts(r["events"])
+        if not by_ts:
+            continue
+        start = r["start_ts"]
+        bins = {"early_round": [], "mid_round": [], "late_round": []}
+        for ts, frame_events in by_ts.items():
+            rel = ts - start
+            bins[get_time_bin_ms(rel)].append(frame_events)
+        # Top locations per bucket
+        atk_e = _top_locations(bins["early_round"], "Enemy")
+        dfn_e = _top_locations(bins["early_round"], "Ally")
+        atk_m = _top_locations(bins["mid_round"], "Enemy")
+        dfn_m = _top_locations(bins["mid_round"], "Ally")
+        atk_l = _top_locations(bins["late_round"], "Enemy")
+        dfn_l = _top_locations(bins["late_round"], "Ally")
 
-    summaries = []
+        # Spike site (prefer explicit A/B based on nearby site detections)
+        site_letter = None  # 'A' or 'B'
+        plants = [e for e in r["events"] if e.get("event_type") == "spike_planted"]
+        if plants:
+            spk = int(plants[0]["timestamp_ms"])
+            a_hits = 0
+            b_hits = 0
+            for ts, frame_events in by_ts.items():
+                if abs(ts - spk) <= 5_000:
+                    for ev in frame_events:
+                        cx = ev["details"].get("center_x"); cy = ev["details"].get("center_y")
+                        if cx is None or cy is None:
+                            continue
+                        loc = loc_from_point(cx, cy)
+                        if loc == "A Site":
+                            a_hits += 1
+                        elif loc == "B Site":
+                            b_hits += 1
+            if a_hits or b_hits:
+                site_letter = 'A' if a_hits >= b_hits else 'B'
+        suffix = f", Bomb planted in {site_letter}" if site_letter else ", Round ended before bomb plant"
+        out.append(
+            f"Round {r['round']}: Early round, Enemy in {atk_e}, Allies in {dfn_e}. "
+            f"Mid round, Enemy in {atk_m}, Allies in {dfn_m}. "
+            f"Late round, Enemy in {atk_l}, Allies in {dfn_l}{suffix}"
+        )
+    return out
 
-    # Helper to convert list of location names to a descriptor
-    def describe_locations(locs: List[str]) -> str:
-        if not locs:
-            return "unknown"
-        most_common = max(set(locs), key=locs.count)
-        confidence = locs.count(most_common) / len(locs)
-        return most_common if confidence >= 0.6 else "spread out"
 
-    for rnd in rounds:
-        half_idx = 1 if rnd["round"] <= 12 else 2
-        side_for_team = {
-            "Enemy": "Attackers" if half_idx == 1 else "Defenders",
-            "Ally": "Defenders" if half_idx == 1 else "Attackers"
-        }
-
-        # Bucket: time_bin -> side -> list[location]
-        bin_locs = {tb: {"Attackers": [], "Defenders": []} for tb in TIME_BINS.keys()}
-
-        events_by_ts = defaultdict(list)
-        for evt in rnd["events"]:
-            if evt.get("event_type") == "agent_detection":
-                events_by_ts[evt["timestamp_ms"]].append(evt)
-
-        round_start_ts = rnd["start_ts"]
-
-        for ts, frame_events in events_by_ts.items():
-            rel_time = ts - round_start_ts
-            time_bin = get_time_bin(rel_time)
-            if time_bin not in bin_locs:
+def analyze_positions(events: List[Dict]) -> Dict[str, Dict[str, Dict[str, List[str]]]]:
+    patterns = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    rounds = segment_events_into_rounds(events)
+    for r in rounds:
+        by_ts = _events_by_ts(r["events"])
+        if not by_ts:
                 continue
+        start = r["start_ts"]
+        # Determine destination preference
+        dest = "Unknown"
+        plants = [e for e in r["events"] if e.get("event_type") == "spike_planted"]
+        if plants:
+            spk = int(plants[0]["timestamp_ms"])
+            a_hits = 0
+            b_hits = 0
+            for ts, frame_events in by_ts.items():
+                if abs(ts - spk) <= 5_000:
+                    for ev in frame_events:
+                        cx = ev["details"].get("center_x"); cy = ev["details"].get("center_y")
+                        if cx is None or cy is None:
+                            continue
+                        loc = loc_from_point(cx, cy)
+                        if loc == "A Site":
+                            a_hits += 1
+                        elif loc == "B Site":
+                            b_hits += 1
+            if a_hits or b_hits:
+                dest = "A Site" if a_hits >= b_hits else "B Site"
+        if dest == "Unknown" and by_ts:
+            last = by_ts[max(by_ts.keys())]
+            sites = [loc_from_point(ev["details"]["center_x"], ev["details"]["center_y"]) for ev in last]
+            sites = [s for s in sites if s in {"A Site", "B Site"}]
+            if sites:
+                dest = max(set(sites), key=sites.count)
+        # Aggregate per time bin and team
+        for ts, frame_events in by_ts.items():
+            tb = get_time_bin_ms(ts - start)
+            for team in ("Enemy", "Ally"):
+                loc = _location_of_team(frame_events, team)
+                if loc:
+                    side = "Attackers" if (team == "Enemy" and r["round"] <= 12) or (team == "Ally" and r["round"] > 12) else "Defenders"
+                    patterns[f"{team}-{side}"][tb][loc].append(dest)
+    return patterns
 
-            for team_label in ["Enemy", "Ally"]:
-                team_positions = [
-                    (e['details']['center_x'], e['details']['center_y'])
-                    for e in frame_events if team_label in e['details']['class_name']
-                ]
-                if not team_positions:
+
+def generate_conclusions(patterns: Dict[str, Dict[str, Dict[str, List[str]]]]) -> List[str]:
+    conclusions: List[str] = []
+    for team_side, bins in patterns.items():
+        team, side = team_side.split("-", 1)
+        for tb, locs in bins.items():
+            for loc, dests in locs.items():
+                if not dests:
                     continue
-                avg_x = np.mean([p[0] for p in team_positions])
-                avg_y = np.mean([p[1] for p in team_positions])
-                loc_name = get_location_name(avg_x, avg_y)
-                if loc_name:
-                    bin_locs[time_bin][side_for_team[team_label]].append(loc_name)
-
-        # Build narrative string
-        segments = []
-        for tb in ["early_round", "mid_round", "late_round"]:
-            atk_desc = describe_locations(bin_locs[tb]["Attackers"])
-            def_desc = describe_locations(bin_locs[tb]["Defenders"])
-            segments.append(f"{tb.replace('_', ' ').title()}: Attackers in {atk_desc}, Defenders in {def_desc}")
-
-        # Infer spike plant site
-        final_ts = max(events_by_ts.keys()) if events_by_ts else None
-        spike_site = None
-        if final_ts is not None:
-            fin_locs = [
-                get_location_name(e['details']['center_x'], e['details']['center_y'])
-                for e in events_by_ts[final_ts]
-            ]
-            fin_valid = [l for l in fin_locs if l in {"A", "B"}]
-            if fin_valid:
-                spike_site = max(set(fin_valid), key=fin_valid.count)
-        if spike_site:
-            segments.append(f"Spike likely planted at {spike_site}")
-
-        summaries.append(f"Round {rnd['round']}: " + "; ".join(segments))
-
-    return summaries
-
-
-def generate_conclusions(position_patterns):
-    """Generate strategic conclusions from positional patterns grouped by team/side."""
-    conclusions = []
-
-    for team_side_key, time_bins in position_patterns.items():
-        team_label, side = team_side_key.split("-", 1)
-
-        for time_bin, locations in time_bins.items():
-            for location, destinations in locations.items():
-                if not destinations:
+                mc = max(set(dests), key=dests.count)
+                conf = dests.count(mc) / len(dests)
+                # Prevent impossible mappings: Source on A-side shouldn't predict B Site and vice versa
+                if (" a " in f" {loc.lower()} " and mc == "B Site") or (" b " in f" {loc.lower()} " and mc == "A Site"):
                     continue
-
-                most_common_destination = max(set(destinations), key=destinations.count)
-                confidence = destinations.count(most_common_destination) / len(destinations)
-
-                if confidence > 0.6 and most_common_destination != "Unknown":
-                    subject = "enemy" if team_label == "Enemy" else "ally"
-                    conclusion = (
-                        f"If the {subject} ({side.lower()}) team is spotted in '{location}' during the '{time_bin}', "
-                        f"they are likely to end at the '{most_common_destination}' bomb site "
-                        f"(seen in {confidence:.0%} of cases)."
+                if mc in {"A Site", "B Site"} and conf >= 0.6:
+                    subj = "enemy" if team == "Enemy" else "ally"
+                    conclusions.append(
+                        f"If the {subj} ({side.lower()}) team is spotted in '{loc}' during the '{tb}', they are likely to end at the '{mc}' bomb site (seen in {conf:.0%} of cases)."
                     )
-                    conclusions.append(conclusion)
-
     return conclusions
 
+
+def _find_report_path(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    # Prefer events files and exclude summaries/conclusions
+    per_video = glob.glob(os.path.join("data", "*", "report", "*.json"))
+    legacy = glob.glob(os.path.join(REPORTS_DIR, "*.json"))
+    all_candidates = per_video or legacy
+    if not all_candidates:
+        raise SystemExit(f"❌ No analysis reports found in data/*/report or {REPORTS_DIR}")
+    # Filter out non-event JSONs
+    def is_event_file(fp: str) -> bool:
+        name = os.path.basename(fp).lower()
+        if "round_summaries" in name or "strategic_conclusions" in name:
+            return False
+        return (name.startswith("events_") or name.endswith("_events_hybrid.json") or name in ("events.json", "events_hybrid.json"))
+    events_only = [f for f in all_candidates if is_event_file(f)]
+    pool = events_only if events_only else [f for f in all_candidates if ("round_summaries" not in f and "strategic_conclusions" not in f)]
+    return max(pool, key=os.path.getctime)
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate strategic conclusions from VOD analysis reports.")
-    parser.add_argument("--map", type=str, required=False, help="Map name to load site mask (e.g., bind, ascent)")
-    parser.add_argument("--report_path", type=str,
-                        help="Path to a specific analysis report JSON file. If not provided, the latest report is used.")
-    
+    parser = argparse.ArgumentParser(description="Generate round summaries and conclusions from events JSON")
+    parser.add_argument("--map", type=str, help="Map name (for site masks)")
+    parser.add_argument("--report_path", type=str, help="Path to events JSON; defaults to newest in data/*/report/")
+    parser.add_argument("--video_dir", type=str, help="Optional data/<title> directory for saving outputs")
     args = parser.parse_args()
-    # Load site polygons if provided
+
     if args.map:
         load_site_polygons(args.map)
     
-    report_to_process = args.report_path
-    if not report_to_process:
-        # Find the newest report file
-        report_files = glob.glob(os.path.join(REPORTS_DIR, "*.json"))
-        if not report_files:
-            print(f"❌ No analysis reports found in {REPORTS_DIR}. Please run the analysis first.")
-            exit(1)
-        report_to_process = max(report_files, key=os.path.getctime)
-        
-    print(f"📄 Analyzing report: {report_to_process}")
-    
-    with open(report_to_process, 'r') as f:
-        events_data = json.load(f)
+    report_path = _find_report_path(args.report_path)
+    print(f"📄 Analyzing report: {report_path}")
+    with open(report_path, "r", encoding="utf-8") as f:
+        events = json.load(f)
 
-    # Round summaries
-    round_summaries = summarize_rounds(events_data)
-        
-    # Analyze positions
-    position_data = analyze_positions(events_data)
-    
-    # Generate conclusions
-    strategic_conclusions = generate_conclusions(position_data)
-    
-    # Print round summaries
+    summaries = summarize_rounds(events)
+    patterns = analyze_positions(events)
+    conclusions = generate_conclusions(patterns)
+
     print("\n--- Round-by-Round Narrative ---")
-    if not round_summaries:
-        print("No round information available.")
-    else:
-        for summary in round_summaries:
-            print(f"📝 {summary}")
+    for line in summaries or ["No round information available."]:
+        print("📝 "+line)
 
-    # Print results
     print("\n--- Strategic Conclusions ---")
-    if not strategic_conclusions:
-        print("🤔 No strong strategic patterns were found in this analysis.")
+    if conclusions:
+        for c in conclusions:
+            print("💡 "+c)
     else:
-        for conc in strategic_conclusions:
-            print(f"💡 {conc}")
+        print("🤔 No strong strategic patterns found.")
 
-    print("\n--- Raw Positional Data (for debugging) ---")
-    print(json.dumps(position_data, indent=2)) 
-    
-    # Save to a file
-    with open("strategic_conclusions.json", "w") as f:
-        json.dump(strategic_conclusions, f, indent=2)
-
-    print("\n📝 Strategic conclusions saved to strategic_conclusions.json")
-
-    # Save round summaries
-    with open("round_summaries.json", "w") as f:
-        json.dump(round_summaries, f, indent=2)
-    print("📝 Round summaries saved to round_summaries.json")
+    # Determine output directory
+    out_dir = None
+    if args.video_dir and os.path.isdir(args.video_dir):
+        out_dir = os.path.join(args.video_dir, "report")
+    else:
+        parts = os.path.normpath(report_path).split(os.sep)
+        out_dir = os.path.join(*parts[:-1]) if len(parts) >= 2 else "."
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "round_summaries.json"), "w", encoding="utf-8") as f:
+        json.dump(summaries, f, indent=2)
+    with open(os.path.join(out_dir, "strategic_conclusions.json"), "w", encoding="utf-8") as f:
+        json.dump(conclusions, f, indent=2)
+    print(f"\n📝 Saved outputs to {out_dir}")

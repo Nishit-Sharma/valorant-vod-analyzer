@@ -80,6 +80,19 @@ This project will be developed in phases:
     pip install -r requirements.txt
     ```
 
+### Windows OCR setup (optional but recommended)
+- Install Tesseract and set the environment variable `TESSERACT_CMD` to the full path of `tesseract.exe`.
+- Example: `setx TESSERACT_CMD "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"`
+
+### Running analysis
+```
+python main.py --map ascent --detection_mode hybrid --confidence 0.6
+```
+Notes:
+- `--map` selects site masks for location labelling.
+- `--confidence` sets the YOLO confidence threshold.
+- Replay segments in VCT broadcasts are automatically skipped when a replay banner is detected.
+
 ## Contribution
 
 This is a living document and will be updated as the project evolves. Contributions are welcome.

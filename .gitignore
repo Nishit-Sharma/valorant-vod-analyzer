@@ -4,8 +4,6 @@ ffprobe.exe
 /data/*
 /*/__pycache__/*
 /__pycache__/*
-/reports/*
-/visualizations/*
-strip_model.py
 .vscode/*
-optimized.pt
+.cursor/*
+/data/MKOI vs FNC - VCT EMEA 2025 Stage 2 - W2 D3 - Map 1

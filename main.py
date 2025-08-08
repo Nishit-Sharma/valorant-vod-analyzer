@@ -9,13 +9,14 @@ import cv2
 from pathlib import Path
 from cv_processing.hybrid_detector import HybridGameEventExtractor, check_yolo_requirements, validate_yolo_model
 
-# Hardcoded paths
-VIDEOS_DIR = "data/videos"
-YOLO_MODEL_PATH = "model/oldmodel.pt"
-TEMPLATES_DIR = "templates"
-OUTPUT_DIR = "reports"
+# Default paths (can be overridden via CLI)
+DATA_ROOT = "data"
+VIDEOS_DIR = os.path.join(DATA_ROOT, "videos")  # legacy; now we prefer per-video data/<title>/video/video.mp4
+YOLO_MODEL_PATH = os.path.join(DATA_ROOT, "model", "oldmodel.pt")
+TEMPLATES_DIR = os.path.join(DATA_ROOT, "templates")
+OUTPUT_DIR = os.path.join(DATA_ROOT, "reports")  # legacy fallback
 VIDEO_LINKS_FILE = "video_links.txt"
-VISUALIZATIONS_DIR = "visualizations"
+VISUALIZATIONS_DIR = os.path.join(DATA_ROOT, "visualizations")  # legacy fallback
 
 class NumpyEncoder(json.JSONEncoder):
     """Custom JSON encoder to handle numpy types"""
@@ -27,6 +28,9 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, np.ndarray):
             return obj.tolist()
         return super().default(obj)
+
+def _safe_title(title: str) -> str:
+    return "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).rstrip()
 
 def download_video(url: str, output_dir: str = VIDEOS_DIR) -> str:
     """
@@ -54,31 +58,37 @@ def download_video(url: str, output_dir: str = VIDEOS_DIR) -> str:
         with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
             info = ydl.extract_info(url, download=False)
             video_title = info['title']
-            
-            # Clean title for filename matching
-            safe_title = "".join(c for c in video_title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-            
+            safe_title = _safe_title(video_title)
+            base_dir = os.path.join(DATA_ROOT, safe_title)
+            video_dir = os.path.join(base_dir, "video")
+            report_dir = os.path.join(base_dir, "report")
+            viz_dir = os.path.join(base_dir, "visualizations")
+            for d in (video_dir, report_dir, viz_dir):
+                os.makedirs(d, exist_ok=True)
             # Check if video already exists
-            existing_files = glob.glob(os.path.join(output_dir, f"*{safe_title[:50]}*"))
-            if existing_files:
-                existing_file = existing_files[0]
-                print(f"✅ Video already exists: {os.path.basename(existing_file)}")
-                return existing_file
+            existing_mp4 = os.path.join(video_dir, f"{video_title}.mp4")
+            if os.path.exists(existing_mp4):
+                print(f"✅ Video already exists: {existing_mp4}")
+                return existing_mp4
             
             print(f"📥 Downloading: {video_title}")
             
             # Download the video
             ydl_opts = {
                 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
+                'outtmpl': os.path.join(video_dir, 'video.%(ext)s'),
                 'merge_output_format': 'mp4',
                 'quiet': False,
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl_download:
                 info_download = ydl_download.extract_info(url, download=True)
+                final_mp4 = os.path.join(video_dir, f"{video_title}.mp4")
+                if os.path.exists(final_mp4):
+                    print(f"✅ Downloaded: {final_mp4}")
+                    return final_mp4
                 downloaded_path = ydl_download.prepare_filename(info_download)
-                print(f"✅ Downloaded: {os.path.basename(downloaded_path)}")
+                print(f"✅ Downloaded: {downloaded_path}")
                 return downloaded_path
                 
     except Exception as e:
@@ -102,14 +112,16 @@ def load_video_urls(file_path: str = VIDEO_LINKS_FILE) -> list:
     return urls
 
 def get_video_files() -> list:
-    """Get all video files in the videos directory"""
+    """Get all video files under data/*/video plus legacy data/videos."""
     video_extensions = ['*.mp4', '*.avi', '*.mov', '*.mkv', '*.webm']
     video_files = []
-    
+    # New per-video structure
+    for ext in video_extensions:
+        video_files.extend(glob.glob(os.path.join(DATA_ROOT, '*', 'video', ext)))
+    # Legacy flat structure
     for ext in video_extensions:
         video_files.extend(glob.glob(os.path.join(VIDEOS_DIR, ext)))
-    
-    return video_files
+    return sorted(set(video_files))
 
 def draw_detection_boxes(frame: np.ndarray, detections: list, timestamp_ms: int) -> np.ndarray:
     """
@@ -127,7 +139,7 @@ def draw_detection_boxes(frame: np.ndarray, detections: list, timestamp_ms: int)
     
     # Color map for different detection methods
     colors = {
-        'yolo': (0, 255, 0),      # Green for YOLO
+        'yolo': (0, 255, 0),       # Green for YOLO
         'template': (255, 0, 0),   # Blue for template
         'hybrid': (0, 255, 255)    # Yellow for hybrid
     }
@@ -135,7 +147,11 @@ def draw_detection_boxes(frame: np.ndarray, detections: list, timestamp_ms: int)
     for detection in detections:
         bbox = detection.bbox if hasattr(detection, 'bbox') else detection.get('details', {}).get('bbox', [0, 0, 0, 0])
         confidence = detection.confidence if hasattr(detection, 'confidence') else detection.get('confidence', 0.0)
-        class_name = detection.class_name if hasattr(detection, 'class_name') else detection.get('details', {}).get('class_name', 'unknown')
+        class_name = (
+            detection.class_name if hasattr(detection, 'class_name') else
+            detection.get('details', {}).get('class_name') or
+            detection.get('details', {}).get('template', 'unknown')
+        )
         method = detection.detection_method if hasattr(detection, 'detection_method') else detection.get('detection_method', 'unknown')
         
         if len(bbox) >= 4:
@@ -193,8 +209,9 @@ def save_detection_visualizations(video_path: str, events: list, max_images: int
         Path to the visualization directory
     """
     # Create visualization directory
-    video_name = Path(video_path).stem
-    viz_dir = os.path.join(VISUALIZATIONS_DIR, video_name)
+    video_dir = Path(video_path).parent
+    base_dir = video_dir.parent  # data/<title>
+    viz_dir = os.path.join(base_dir, "visualizations")
     os.makedirs(viz_dir, exist_ok=True)
     
     if not events:
@@ -347,12 +364,17 @@ def print_analysis_summary(events, detection_mode):
         duration = (max(timestamps) - min(timestamps)) / 1000
         print(f"\n⏱️  Analysis duration: {duration:.1f} seconds")
 
-def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: float = 0.8, max_viz_images: int = 10, output_dir: str = OUTPUT_DIR) -> bool:
+def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: float = 0.8, max_viz_images: int = 10, output_dir: str = OUTPUT_DIR, map_name: str = "ascent", yolo_model_path: str = YOLO_MODEL_PATH, templates_dir: str = TEMPLATES_DIR) -> bool:
     """Analyze a single video file"""
     print(f"\n🎮 Analyzing: {os.path.basename(video_path)}")
     print("=" * 60)
     
-    # Check if results already exist
+    # Derive per-video dirs and output path (data/<title>/report/...)
+    video_dir = Path(video_path).parent
+    base_dir = video_dir.parent  # data/<title>
+    per_video_report = os.path.join(base_dir, 'report')
+    os.makedirs(per_video_report, exist_ok=True)
+    output_dir = per_video_report
     base_name = Path(video_path).stem
     output_filename = f"{base_name}_events_{detection_mode}.json"
     output_path = os.path.join(output_dir, output_filename)
@@ -362,27 +384,25 @@ def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: f
     if analysis_exists:
         print(f"⏭️  Analysis already exists: {output_filename}")
         
-        # Generate visualizations if they don't exist
-        base_name = Path(video_path).stem
-        viz_dir = os.path.join(VISUALIZATIONS_DIR, base_name)
-        
-        if max_viz_images > 0 and (not os.path.exists(viz_dir) or len(os.listdir(viz_dir)) == 0):
-            print(f"📸 Generating visualizations...")
-            # Load existing events
-            with open(output_path, 'r') as f:
-                events = json.load(f)
-            save_detection_visualizations(video_path, events, max_viz_images)
+        # Generate visualizations into per-video visualizations dir
+        if max_viz_images > 0:
+            try:
+                with open(output_path, 'r') as f:
+                    events = json.load(f)
+                save_detection_visualizations(video_path, events, max_viz_images)
+            except Exception as e:
+                print(f"⚠️  Skipped visualization regeneration: {e}")
         
         return True
     
     # Validate YOLO model if using YOLO modes
     if detection_mode in ["yolo", "hybrid"]:
-        if not os.path.exists(YOLO_MODEL_PATH):
-            print(f"❌ YOLO model not found: {YOLO_MODEL_PATH}")
+        if not os.path.exists(yolo_model_path):
+            print(f"❌ YOLO model not found: {yolo_model_path}")
             return False
         
         print(f"🔍 Validating YOLO model...")
-        if not validate_yolo_model(YOLO_MODEL_PATH):
+        if not validate_yolo_model(yolo_model_path):
             print("❌ YOLO model validation failed")
             return False
     
@@ -391,9 +411,11 @@ def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: f
         print(f"🚀 Initializing {detection_mode} detection...")
         extractor = HybridGameEventExtractor(
             video_path=video_path,
-            yolo_model_path=YOLO_MODEL_PATH if detection_mode in ["yolo", "hybrid"] else None,
-            templates_dir=TEMPLATES_DIR,
-            detection_mode=detection_mode
+            yolo_model_path=yolo_model_path if detection_mode in ["yolo", "hybrid"] else None,
+            templates_dir=templates_dir,
+            detection_mode=detection_mode,
+            map_name=map_name,
+            yolo_confidence_threshold=confidence
         )
         
         # Extract events
@@ -420,7 +442,7 @@ def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: f
         print(f"❌ Error analyzing {video_path}: {e}")
         return False
 
-def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, download: bool = True, max_viz_images: int = 10) -> None:
+def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, download: bool = True, max_viz_images: int = 10, map_name: str = "ascent", yolo_model_path: str = YOLO_MODEL_PATH, templates_dir: str = TEMPLATES_DIR) -> None:
     """Process all videos: download from URLs and analyze existing files"""
     print("🚀 Valorant VOD Analyzer - Batch Processing")
     print("=" * 60)
@@ -437,7 +459,7 @@ def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, 
             print(f"\n📥 Processing URL: {url}")
             video_path = download_video(url)
             if video_path:
-                if analyze_video(video_path, detection_mode, confidence, max_viz_images):
+                if analyze_video(video_path, detection_mode, confidence, max_viz_images, map_name=map_name, yolo_model_path=yolo_model_path, templates_dir=templates_dir):
                     processed_count += 1
                 else:
                     failed_count += 1
@@ -445,14 +467,14 @@ def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, 
                 failed_count += 1
     
     # Process existing video files
-    print(f"\n📁 Processing existing videos in {VIDEOS_DIR}...")
+    print(f"\n📁 Processing existing videos in data/*/video ...")
     video_files = get_video_files()
     
     if not video_files:
         print(f"⚠️  No video files found in {VIDEOS_DIR}")
     else:
         for video_path in video_files:
-            if analyze_video(video_path, detection_mode, confidence, max_viz_images):
+            if analyze_video(video_path, detection_mode, confidence, max_viz_images, map_name=map_name, yolo_model_path=yolo_model_path, templates_dir=templates_dir):
                 processed_count += 1
             else:
                 failed_count += 1
@@ -529,6 +551,9 @@ Hardcoded Paths:
     
     parser.add_argument("--confidence", type=float, default=0.8,
                        help="YOLO confidence threshold (default: 0.8)")
+    parser.add_argument("--map", type=str, default="ascent", help="Map name for site masks (e.g., ascent, bind)")
+    parser.add_argument("--yolo_model", type=str, default=YOLO_MODEL_PATH, help="Path to YOLO .pt weights")
+    parser.add_argument("--templates_dir", type=str, default=TEMPLATES_DIR, help="Path to templates directory")
     
     parser.add_argument("--no_download", action="store_true",
                        help="Skip downloading videos from URLs, only process existing files")
@@ -561,7 +586,16 @@ Hardcoded Paths:
     if args.video_path:
         # Single video mode
         print("🎯 Single Video Mode")
-        success = analyze_video(args.video_path, args.detection_mode, args.confidence, args.max_viz_images, args.output_dir)
+        success = analyze_video(
+            args.video_path,
+            args.detection_mode,
+            args.confidence,
+            args.max_viz_images,
+            args.output_dir,
+            map_name=args.map,
+            yolo_model_path=args.yolo_model,
+            templates_dir=args.templates_dir,
+        )
         sys.exit(0 if success else 1)
     else:
         # Batch processing mode (default)
@@ -569,6 +603,9 @@ Hardcoded Paths:
             detection_mode=args.detection_mode,
             confidence=args.confidence,
             download=not args.no_download,
-            max_viz_images=args.max_viz_images
+            max_viz_images=args.max_viz_images,
+            map_name=args.map,
+            yolo_model_path=args.yolo_model,
+            templates_dir=args.templates_dir,
         )
         sys.exit(0)

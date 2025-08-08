@@ -7,6 +7,9 @@ import torch
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
 from pathlib import Path
+from shapely.geometry import Point, Polygon
+from shapely.errors import TopologicalError
+from shapely.validation import make_valid
 
 try:
     from ultralytics import YOLO
@@ -26,6 +29,9 @@ class Detection:
     detection_method: str  # "yolo" or "template"
     additional_info: Dict = None
 
+MINIMAP_X0 = 70
+MINIMAP_Y0 = 52
+
 def crop_to_minimap(frame: np.ndarray) -> np.ndarray:
     """
     Crops the frame to the minimap area (top-left 640x640).
@@ -37,7 +43,7 @@ def crop_to_minimap(frame: np.ndarray) -> np.ndarray:
         The cropped frame.
     """
     # return frame[0:640, 0:640]
-    return frame[52:406, 70:405]
+    return frame[MINIMAP_Y0:406, MINIMAP_X0:405]
 
 class YOLODetector:
     """YOLO-based agent detection for Valorant"""
@@ -113,7 +119,8 @@ class HybridDetector:
     def __init__(self, 
                  yolo_model_path: Optional[str] = None,
                  templates_dir: str = "templates",
-                 detection_mode: str = "hybrid"):
+                 detection_mode: str = "hybrid",
+                 yolo_confidence_threshold: float = 0.5):
         """
         Initialize hybrid detector
         
@@ -130,7 +137,7 @@ class HybridDetector:
         if detection_mode in ["yolo", "hybrid"] and yolo_model_path:
             if YOLO_AVAILABLE:
                 try:
-                    self.yolo_detector = YOLODetector(yolo_model_path)
+                    self.yolo_detector = YOLODetector(yolo_model_path, confidence_threshold=yolo_confidence_threshold)
                     print(f"✅ YOLO detector initialized: {yolo_model_path}")
                 except Exception as e:
                     print(f"❌ Failed to initialize YOLO detector: {e}")
@@ -145,14 +152,17 @@ class HybridDetector:
         if detection_mode in ["template", "hybrid"]:
             try:
                 from cv_processing.optimized_template_matcher import OptimizedValorantTemplateDetector
-                self.template_detector = OptimizedValorantTemplateDetector(templates_dir)
+                # Prefer templates under data/templates
+                data_templates = os.path.join("data", "templates")
+                use_templates = data_templates if os.path.exists(data_templates) else templates_dir
+                self.template_detector = OptimizedValorantTemplateDetector(use_templates)
                 print(f"✅ Template detector initialized: {templates_dir}")
             except Exception as e:
                 print(f"❌ Failed to initialize template detector: {e}")
                 if detection_mode == "template":
                     raise
     
-    def detect_in_frame(self, frame: np.ndarray, timestamp_ms: int) -> Tuple[List[Detection], List]:
+    def detect_in_frame(self, frame: np.ndarray, timestamp_ms: int, minimap_frame: Optional[np.ndarray] = None) -> Tuple[List[Detection], List]:
         """
         Detect objects in frame using selected method(s)
         
@@ -162,13 +172,15 @@ class HybridDetector:
         unified_detections = []
         template_matches = []
         
-        # YOLO detection
+        # YOLO detection (prefer minimap crop when provided)
         if self.yolo_detector and self.detection_mode in ["yolo", "hybrid"]:
-            yolo_detections = self.yolo_detector.detect_agents(frame, timestamp_ms)
+            yolo_input = minimap_frame if minimap_frame is not None else frame
+            yolo_detections = self.yolo_detector.detect_agents(yolo_input, timestamp_ms)
             unified_detections.extend(yolo_detections)
         
         # Template matching detection
         if self.template_detector and self.detection_mode in ["template", "hybrid"]:
+            # Always use full frame for UI/killfeed/abilities template matching
             template_matches = self.template_detector.detect_in_frame(frame, timestamp_ms)
             
             # Convert template matches to unified detection format
@@ -207,7 +219,7 @@ class HybridDetector:
         unified_detections, _ = self.detect_in_frame(frame, timestamp_ms)
         return unified_detections
     
-    def analyze_video(self, video_path: str, frame_skip: int = 30) -> Tuple[List[Detection], List]:
+    def analyze_video(self, video_path: str, frame_skip: int = 30, strict_scoreboard_only: bool = False) -> Tuple[List[Detection], List]:
         """Analyze entire video with progress tracking"""
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -229,9 +241,13 @@ class HybridDetector:
         
         start_time = time.time()
         
-        from cv_processing.scoreboard_detector import ScoreboardDetector, ScoreboardInfo
+        from cv_processing.scoreboard_detector import ScoreboardDetector, ScoreboardInfo, ReplayDetector
         sb_detector = ScoreboardDetector((int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), 3))
+        replay_detector = ReplayDetector()
         last_round_number = None
+        last_bomb_planted = False  # Track bomb planted state
+        in_replay = False
+        last_time_seconds: Optional[int] = None
 
         while True:
             ret, frame = cap.read()
@@ -241,26 +257,77 @@ class HybridDetector:
             if frame_count % frame_skip == 0:
                 # --- Scoreboard parsing ---
                 sb_info: ScoreboardInfo = sb_detector.parse(frame)
-                if sb_info.round_number is not None and sb_info.round_number != last_round_number:
-                    # Inject explicit round_start event
-                    scoreboard_event = {
+
+                # --- Replay skip (template/OCR banner or timer increases) ---
+                in_replay = replay_detector.is_replay(frame)
+                # Round number regression indicates replay/cutaway to an earlier round
+                round_regresses = (
+                    sb_info.round_number is not None and last_round_number is not None and sb_info.round_number < last_round_number
+                )
+                if in_replay or round_regresses:
+                    # Do not update last_time_seconds to avoid locking into replay state
+                    frame_count += 1
+                    continue
+                # Update timer trend
+                if sb_info.time_seconds is not None:
+                    last_time_seconds = sb_info.time_seconds
+
+                # Scoreboard visibility gating
+                scoreboard_present = (sb_info.round_number is not None) or (sb_info.time_seconds is not None)
+                if strict_scoreboard_only and not scoreboard_present:
+                    frame_count += 1
+                    continue
+
+                # --- Spike plant detection ---
+                if sb_info.bomb_planted and not last_bomb_planted:
+                    scoreboard_events.append({
                         "timestamp_ms": int((frame_count / fps) * 1000),
-                        "event_type": "round_start",
-                        "details": {
-                            "round_number": sb_info.round_number,
-                            "time_seconds": sb_info.time_seconds,
-                            "bomb_planted": sb_info.bomb_planted
-                        }
-                    }
-                    scoreboard_events.append(scoreboard_event)
-                    last_round_number = sb_info.round_number
+                        "event_type": "spike_planted",
+                        "details": {}
+                    })
+                last_bomb_planted = sb_info.bomb_planted
+
+                # --- Round start detection (robust + monotonic gating) ---
+                created_round_start = False
+                if sb_info.round_number is not None:
+                    rn = sb_info.round_number
+                    if 1 <= rn <= 30 and (last_round_number is None or (rn > last_round_number and rn <= last_round_number + 1)):
+                        scoreboard_events.append({
+                            "timestamp_ms": int((frame_count / fps) * 1000),
+                            "event_type": "round_start",
+                            "details": {
+                                "round_number": rn,
+                                "time_seconds": sb_info.time_seconds,
+                                "bomb_planted": sb_info.bomb_planted,
+                                "source": "scoreboard_round"
+                            }
+                        })
+                        last_round_number = rn
+                        created_round_start = True
+
+                # If OCR failed to read round number, synthesize round start on large timer reset (e.g., ~1:40)
+                if not created_round_start and last_time_seconds is not None and sb_info.time_seconds is not None:
+                    if sb_info.time_seconds - last_time_seconds >= 30:
+                        rn = (last_round_number + 1) if last_round_number is not None else None
+                        scoreboard_events.append({
+                            "timestamp_ms": int((frame_count / fps) * 1000),
+                            "event_type": "round_start",
+                            "details": {
+                                "round_number": rn,
+                                "time_seconds": sb_info.time_seconds,
+                                "bomb_planted": sb_info.bomb_planted,
+                                "source": "timer_reset"
+                            }
+                        })
+                        if rn is not None:
+                            last_round_number = rn
 
                 timestamp_ms = int((frame_count / fps) * 1000)
                 
-                # Crop frame to minimap
+                # Crop frame to minimap for YOLO agent detection
                 minimap_frame = crop_to_minimap(frame)
-                
-                detections, template_matches = self.detect_in_frame(minimap_frame, timestamp_ms)
+                # Detect using both sources appropriately
+                detections, template_matches = self.detect_in_frame(frame, timestamp_ms, minimap_frame=minimap_frame)
                 
                 all_detections.extend(detections)
                 all_template_matches.extend(template_matches)
@@ -307,7 +374,9 @@ class HybridGameEventExtractor:
                  video_path: str, 
                  yolo_model_path: Optional[str] = None,
                  templates_dir: str = "templates",
-                 detection_mode: str = "hybrid"):
+                 detection_mode: str = "hybrid",
+                 map_name: str = "ascent",
+                 yolo_confidence_threshold: float = 0.5):
         """
         Initialize hybrid extractor
         
@@ -319,6 +388,8 @@ class HybridGameEventExtractor:
         """
         self.video_path = video_path
         self.detection_mode = detection_mode
+        self.map_name = map_name
+        self.site_polygons = self._load_site_polygons(map_name)
         
         # Validate video
         self.cap = cv2.VideoCapture(video_path)
@@ -326,7 +397,12 @@ class HybridGameEventExtractor:
             raise ValueError(f"Error opening video file: {video_path}")
         
         # Initialize hybrid detector
-        self.detector = HybridDetector(yolo_model_path, templates_dir, detection_mode)
+        self.detector = HybridDetector(
+            yolo_model_path,
+            templates_dir,
+            detection_mode,
+            yolo_confidence_threshold=yolo_confidence_threshold
+        )
         
         print(f"🎮 HybridGameEventExtractor initialized")
         print(f"📹 Video: {video_path}")
@@ -339,8 +415,12 @@ class HybridGameEventExtractor:
         """Extract events using hybrid detection"""
         print(f"\n🚀 Starting hybrid analysis...")
         
-        # Analyze video
-        detections, template_matches, scoreboard_events = self.detector.analyze_video(self.video_path, frame_skip=30)
+        # Analyze video at ~1-second intervals (dynamic based on FPS)
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        frame_skip = max(1, int(round(fps)))
+        detections, template_matches, scoreboard_events = self.detector.analyze_video(
+            self.video_path, frame_skip=frame_skip, strict_scoreboard_only=False
+        )
         
         # Convert to events format
         events = self._convert_detections_to_events(detections)
@@ -364,36 +444,62 @@ class HybridGameEventExtractor:
         events = []
         
         for detection in detections:
-            # Only process agent detections
-            if "agent" not in detection.class_name.lower() and detection.detection_method != "yolo":
-                continue
-
-            event_type = "agent_detection"
-            
-            # Calculate center of bounding box
             x1, y1, x2, y2 = detection.bbox
             center_x = (x1 + x2) / 2
             center_y = (y1 + y2) / 2
-            
-            event = {
-                "timestamp_ms": detection.timestamp_ms,
-                "event_type": event_type,
-                "confidence": detection.confidence,
-                "detection_method": detection.detection_method,
-                "details": {
-                    "class_name": detection.class_name,
-                    "bbox": detection.bbox,
-                    "center_x": center_x,
-                    "center_y": center_y,
-                    "bbox_area": (x2 - x1) * (y2 - y1)
+
+            if detection.detection_method == "yolo":
+                event_type = "agent_detection"
+                # Keep minimap-crop coords for spatial analysis, and also provide full-frame coords
+                bbox_minimap = (x1, y1, x2, y2)
+                center_minimap_x = center_x
+                center_minimap_y = center_y
+                frame_bbox = (x1 + MINIMAP_X0, y1 + MINIMAP_Y0, x2 + MINIMAP_X0, y2 + MINIMAP_Y0)
+                frame_center_x = center_x + MINIMAP_X0
+                frame_center_y = center_y + MINIMAP_Y0
+
+                event = {
+                    "timestamp_ms": detection.timestamp_ms,
+                    "event_type": event_type,
+                    "confidence": detection.confidence,
+                    "detection_method": detection.detection_method,
+                    "details": {
+                        "class_name": detection.class_name,
+                        "bbox": bbox_minimap,
+                        "center_x": center_minimap_x,
+                        "center_y": center_minimap_y,
+                        "frame_bbox": frame_bbox,
+                        "frame_center_x": frame_center_x,
+                        "frame_center_y": frame_center_y,
+                        "bbox_area": (x2 - x1) * (y2 - y1),
+                        "location": self._get_location_name(center_minimap_x, center_minimap_y, bbox_minimap)
+                    }
                 }
-            }
-            
-            # Add method-specific details
-            if detection.additional_info:
-                event["details"].update(detection.additional_info)
-            
-            events.append(event)
+                if detection.additional_info:
+                    event["details"].update(detection.additional_info)
+                events.append(event)
+            else:
+                # Template-derived events (weapons/abilities/game_states/agents)
+                category = detection.additional_info.get("template_category") if detection.additional_info else None
+                if not category and "/" in detection.class_name:
+                    category = detection.class_name.split("/", 1)[0]
+                template_name = detection.class_name.split("/", 1)[-1]
+                event_type = self._infer_event_type_from_template(category or "", template_name)
+                event = {
+                    "timestamp_ms": detection.timestamp_ms,
+                    "event_type": event_type,
+                    "confidence": detection.confidence,
+                    "detection_method": detection.detection_method,
+                    "details": {
+                        "template": detection.class_name,
+                        "category": category,
+                        "bbox": detection.bbox,
+                        "center_x": center_x,
+                        "center_y": center_y,
+                        "template_size": detection.additional_info.get("template_size") if detection.additional_info else None,
+                    }
+                }
+                events.append(event)
         
         return events
     
@@ -436,6 +542,77 @@ class HybridGameEventExtractor:
         print(f"🔧 Filtered {len(events)} events down to {len(filtered_events)} unique events")
         return filtered_events
     
+    def _get_location_name(self, x: float, y: float, bbox: Tuple[int,int,int,int]=None) -> str:
+        """Return region name using polygon masks.
+
+        Strategy:
+        1. If bbox supplied, compute intersection area between bbox-rect and each polygon; choose max >0.
+        2. Fallback to point-in-polygon test using centre.
+        """
+        if not self.site_polygons:
+            return "Unknown"
+
+        if bbox is not None:
+            x1,y1,x2,y2 = bbox
+            bx = [(x1,y1),(x2,y1),(x2,y2),(x1,y2)]
+            bbox_poly = Polygon(bx)
+            best_region = None
+            best_area   = 0.0
+            for region, polys in self.site_polygons.items():
+                for poly in polys:
+                    try:
+                        inter_area = poly.intersection(bbox_poly).area
+                    except TopologicalError:
+                        # Invalid polygon, skip
+                        continue
+                    if inter_area > best_area:
+                        best_area = inter_area
+                        best_region = region
+            if best_area > 0:
+                return best_region
+
+        # fallback to centre point
+        p = Point(x, y)
+        for region, polys in self.site_polygons.items():
+            for poly in polys:
+                try:
+                    if poly.contains(p):
+                        return region
+                except TopologicalError:
+                    continue
+        return "Unknown"
+
+    def _load_site_polygons(self, map_name: str) -> Dict[str, List[Polygon]]:
+        """Load polygons for a map from site_masks/{map}.json"""
+        # Prefer masks under data/site_masks
+        data_mask = os.path.join("data", "site_masks", f"{map_name}.json")
+        mask_path = data_mask if os.path.exists(data_mask) else os.path.join("site_masks", f"{map_name}.json")
+        polygons = {}
+        if not os.path.exists(mask_path):
+            print(f"⚠️  Polygon mask for map '{map_name}' not found. Location tagging disabled.")
+            return polygons
+        try:
+            with open(mask_path, "r") as f:
+                data = json.load(f)
+            for region_name, pts in data.items():
+                if not pts:
+                    continue
+                poly = Polygon(pts)
+                # Attempt to auto-fix invalid polygons
+                if not poly.is_valid:
+                    if make_valid is not None:
+                        poly = make_valid(poly)
+                    else:
+                        poly = poly.buffer(0)
+                if poly.is_valid:
+                    polygons.setdefault(region_name, []).append(poly)
+                else:
+                     print(f"⚠️  Skipped invalid polygon for region '{region_name}'.")
+            print(f"✅ Loaded {sum(len(v) for v in polygons.values())} polygons for map '{map_name}'.")
+        except Exception as e:
+            print(f"⚠️  Failed to load polygon mask: {e}")
+        return polygons
+
     def _get_placeholder_events(self) -> List[Dict]:
         """Fallback placeholder events"""
         placeholder_msg = "No detections found. "
