@@ -52,7 +52,7 @@ export default function UploadPage() {
         <label className="block text-sm mb-2">YouTube links (one per line)</label>
         <textarea className="w-full h-24 border rounded p-2 mb-3 card" placeholder="https://www.youtube.com/watch?v=..." onChange={(e)=> (window._ytlinks = e.target.value)} />
         <button disabled={busy || !map} className="px-3 py-2 rounded btn disabled:opacity-50">{busy ? "Starting..." : "Run"}</button>
-        {status ? <div className="mt-3 text-sm text-gray-700">{status}</div> : null}
+        {status ? <pre className="mt-3 text-xs whitespace-pre-wrap text-gray-700 bg-black/5 p-2 rounded max-h-64 overflow-auto">{status}</pre> : null}
       </motion.form>
     </div>
   );

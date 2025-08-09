@@ -7,6 +7,9 @@ import yt_dlp
 import glob
 import cv2
 from pathlib import Path
+import urllib.request
+import urllib.error
+import time
 from cv_processing.hybrid_detector import HybridGameEventExtractor, check_yolo_requirements, validate_yolo_model
 
 # Default paths (can be overridden via CLI)
@@ -76,7 +79,7 @@ def download_video(url: str, output_dir: str = VIDEOS_DIR) -> str:
             # Download the video
             ydl_opts = {
                 'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                'outtmpl': os.path.join(video_dir, 'video.%(ext)s'),
+                'outtmpl': os.path.join(video_dir, f'{video_title}.%(ext)s'),
                 'merge_output_format': 'mp4',
                 'quiet': False,
             }
@@ -364,7 +367,58 @@ def print_analysis_summary(events, detection_mode):
         duration = (max(timestamps) - min(timestamps)) / 1000
         print(f"\n⏱️  Analysis duration: {duration:.1f} seconds")
 
-def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: float = 0.8, max_viz_images: int = 10, output_dir: str = OUTPUT_DIR, map_name: str = "ascent", yolo_model_path: str = YOLO_MODEL_PATH, templates_dir: str = TEMPLATES_DIR) -> bool:
+def _backend_base_url() -> str:
+    return os.environ.get("BACKEND_URL", "http://localhost:8000").rstrip("/")
+
+
+def _post_json(url: str, payload: dict, headers: dict | None = None) -> tuple[int, str]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json", **(headers or {})}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            status = resp.getcode()
+            body = resp.read().decode("utf-8", errors="ignore")
+            return status, body
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        return e.code, body
+    except Exception as e:
+        return 0, str(e)
+
+
+def _send_analysis_to_backend(ext_id: str, map_name: str | None, events: list) -> None:
+    base = _backend_base_url()
+    created_ms = None
+    try:
+        if events:
+            created_ms = int(min(e.get("timestamp_ms", 0) for e in events))
+    except Exception:
+        created_ms = None
+    payload = {
+        "ext_id": ext_id,
+        "map": map_name.capitalize() if isinstance(map_name, str) and map_name else None,
+        "created_ms": created_ms,
+        "events": events or [],
+    }
+    status, body = _post_json(f"{base}/analyses", payload)
+    if status == 201 or status == 200:
+        print(f"🌐 Backend: created analysis '{ext_id}' with {len(events)} event(s)")
+        return
+    if status == 409:
+        # Already exists: append events
+        ap_status, ap_body = _post_json(f"{base}/analyses/{urllib.parse.quote(ext_id)}/events", {"events": events or []})
+        if ap_status in (200, 201):
+            print(f"🌐 Backend: appended {len(events)} event(s) to '{ext_id}'")
+        else:
+            print(f"⚠️  Backend append failed: {ap_status} {ap_body[:200]}")
+        return
+    if status == 0:
+        print(f"⚠️  Backend unreachable at {_backend_base_url()} ({body})")
+    else:
+        print(f"⚠️  Backend create failed: {status} {body[:200]}")
+
+
+def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: float = 0.8, max_viz_images: int = 10, output_dir: str = OUTPUT_DIR, map_name: str = "ascent", yolo_model_path: str = YOLO_MODEL_PATH, templates_dir: str = TEMPLATES_DIR, post_backend: bool = True) -> bool:
     """Analyze a single video file"""
     print(f"\n🎮 Analyzing: {os.path.basename(video_path)}")
     print("=" * 60)
@@ -392,6 +446,15 @@ def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: f
                 save_detection_visualizations(video_path, events, max_viz_images)
             except Exception as e:
                 print(f"⚠️  Skipped visualization regeneration: {e}")
+        # Optionally push to backend
+        if post_backend:
+            ext_id = os.path.basename(base_dir)
+            try:
+                with open(output_path, 'r') as f:
+                    events = json.load(f)
+                _send_analysis_to_backend(ext_id, map_name, events)
+            except Exception as e:
+                print(f"⚠️  Backend push skipped: {e}")
         
         return True
     
@@ -436,13 +499,17 @@ def analyze_video(video_path: str, detection_mode: str = "hybrid", confidence: f
         
         # Print analysis summary
         print_analysis_summary(events, detection_mode)
+        # Push to backend
+        if post_backend:
+            ext_id = os.path.basename(base_dir)
+            _send_analysis_to_backend(ext_id, map_name, events)
         return True
         
     except Exception as e:
         print(f"❌ Error analyzing {video_path}: {e}")
         return False
 
-def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, download: bool = True, max_viz_images: int = 10, map_name: str = "ascent", yolo_model_path: str = YOLO_MODEL_PATH, templates_dir: str = TEMPLATES_DIR) -> None:
+def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, download: bool = True, max_viz_images: int = 10, map_name: str = "ascent", yolo_model_path: str = YOLO_MODEL_PATH, templates_dir: str = TEMPLATES_DIR, post_backend: bool = True) -> None:
     """Process all videos: download from URLs and analyze existing files"""
     print("🚀 Valorant VOD Analyzer - Batch Processing")
     print("=" * 60)
@@ -459,7 +526,7 @@ def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, 
             print(f"\n📥 Processing URL: {url}")
             video_path = download_video(url)
             if video_path:
-                if analyze_video(video_path, detection_mode, confidence, max_viz_images, map_name=map_name, yolo_model_path=yolo_model_path, templates_dir=templates_dir):
+                if analyze_video(video_path, detection_mode, confidence, max_viz_images, map_name=map_name, yolo_model_path=yolo_model_path, templates_dir=templates_dir, post_backend=post_backend):
                     processed_count += 1
                 else:
                     failed_count += 1
@@ -474,7 +541,7 @@ def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, 
         print(f"⚠️  No video files found in {VIDEOS_DIR}")
     else:
         for video_path in video_files:
-            if analyze_video(video_path, detection_mode, confidence, max_viz_images, map_name=map_name, yolo_model_path=yolo_model_path, templates_dir=templates_dir):
+            if analyze_video(video_path, detection_mode, confidence, max_viz_images, map_name=map_name, yolo_model_path=yolo_model_path, templates_dir=templates_dir, post_backend=post_backend):
                 processed_count += 1
             else:
                 failed_count += 1
@@ -483,7 +550,7 @@ def process_all_videos(detection_mode: str = "hybrid", confidence: float = 0.8, 
     print(f"\n🏁 Batch Processing Complete!")
     print(f"✅ Successfully processed: {processed_count}")
     print(f"❌ Failed: {failed_count}")
-    print(f"📊 Results saved in: {OUTPUT_DIR}")
+    print(f"📊 Results saved under per-video directories in data/*/report (and visualizations in data/*/visualizations)")
 
 def main_single_video(args):
     """Process a single video file (legacy mode)"""
@@ -560,6 +627,7 @@ Hardcoded Paths:
     
     parser.add_argument("--max_viz_images", type=int, default=10,
                        help="Maximum number of visualization images to save per video (default: 10)")
+    parser.add_argument("--no_post_backend", action="store_true", help="Do not post analyses to backend")
     
     # Utility arguments
     parser.add_argument("--setup_templates", action="store_true",
@@ -595,6 +663,7 @@ Hardcoded Paths:
             map_name=args.map,
             yolo_model_path=args.yolo_model,
             templates_dir=args.templates_dir,
+            post_backend=not args.no_post_backend,
         )
         sys.exit(0 if success else 1)
     else:
@@ -607,5 +676,6 @@ Hardcoded Paths:
             map_name=args.map,
             yolo_model_path=args.yolo_model,
             templates_dir=args.templates_dir,
+            post_backend=not args.no_post_backend,
         )
         sys.exit(0)

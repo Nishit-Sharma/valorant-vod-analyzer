@@ -5,6 +5,18 @@ function repoPath(rel) { return path.resolve(process.cwd(), "..", rel); }
 
 export async function GET() {
   try {
+    const backend = process.env.NEXT_PUBLIC_BACKEND_URL || null;
+    if (backend) {
+      try {
+        const r = await fetch(`${backend.replace(/\/$/, "")}/analyses?limit=100`, { cache: "no-store" });
+        if (r.ok) {
+          const j = await r.json();
+          const items = (Array.isArray(j) ? j : []).map((a)=> ({ id: a.ext_id, file: `${a.ext_id}_events_hybrid.json`, map: a.map || null, createdAt: a.created_ms || 0 }));
+          items.sort((a, b) => b.createdAt - a.createdAt);
+          return Response.json({ analysis: items });
+        }
+      } catch {}
+    }
     const dataDir = repoPath("data");
     let entries = [];
     try { entries = await fs.readdir(dataDir, { withFileTypes: true }); } catch { entries = []; }

@@ -28,11 +28,31 @@ export async function GET(req,{ params }){
   const rawId = resolved?.id;
   const id = fullyDecode(Array.isArray(rawId) ? rawId[0] : rawId || "");
   try {
+    // Prefer backend if configured
+    const backend = process.env.NEXT_PUBLIC_BACKEND_URL || null;
+    if (backend) {
+      try {
+        const r = await fetch(`${backend.replace(/\/$/, "")}/analyses/${encodeURIComponent(id)}`, { cache: "no-store" });
+        if (r.ok) {
+          const j = await r.json();
+          const events = Array.isArray(j?.events) ? j.events : [];
+          const { minTs, maxTs } = getMinMaxTs(events);
+          return Response.json({ id, events, meta: { minTs, maxTs, durationMs: Math.max(0, maxTs-minTs), map: j?.map || inferMapFromId(id), count: events.length } });
+        }
+      } catch {}
+    }
     const dataRoot = getDataDir();
     const idSlug = slugify(id);
     // Try exact directory, else fuzzy match by slug across data/*
     let dataDir = path.join(dataRoot, id, "report");
-    let files = await fs.readdir(dataDir).catch(()=>[]);
+    // Prevent path traversal outside of dataRoot
+    const resolvedDataRoot = path.resolve(dataRoot) + path.sep;
+    const resolvedCandidate = path.resolve(dataDir);
+    let files = [];
+    if (resolvedCandidate.startsWith(resolvedDataRoot)) {
+      files = await fs.readdir(resolvedCandidate).catch(()=>[]);
+      dataDir = resolvedCandidate;
+    }
     if (files.length === 0) {
       const allDirs = await fs.readdir(dataRoot).catch(()=>[]);
       let match = null;

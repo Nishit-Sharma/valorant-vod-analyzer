@@ -15,6 +15,12 @@ export async function GET(req,{ params }){
     try {
       const folder = getVizDirFor(id);
       const filePath = path.join(folder, img);
+      // Prevent path traversal
+      const safePath = path.resolve(filePath);
+      const base = path.resolve(folder) + path.sep;
+      if (!safePath.startsWith(base)) {
+        return new Response("Forbidden", { status: 403 });
+      }
       const data = await fs.readFile(filePath);
       const contentType = mime.getType(filePath) || "application/octet-stream";
       return new Response(data, { headers: { "Content-Type": contentType, "Cache-Control": "public, max-age=60" } });

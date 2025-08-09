@@ -54,7 +54,7 @@ class ScoreboardDetector:
     """
 
     # Regex patterns for OCR output
-    _ROUND_RE = re.compile(r"ROUND\s*(\d+)", re.IGNORECASE)
+    _ROUND_RE = re.compile(r"(?:ROUND|R0UND|RD)\s*(\d+)", re.IGNORECASE)
     _TIME_RE = re.compile(r"(\d{1,2})[:](\d{2})")
 
     def __init__(self, frame_shape: Tuple[int, int, int]):
@@ -72,43 +72,65 @@ class ScoreboardDetector:
         # Increase contrast and threshold for clearer OCR
         blur = cv2.GaussianBlur(gray, (3, 3), 0)
         _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return thresh
+        # Morph close to connect digit strokes
+        kernel = np.ones((3, 3), np.uint8)
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+        return closed
 
     def parse(self, frame: np.ndarray) -> ScoreboardInfo:
         x, y, w, h = self.roi
-        crop = frame[y : y + h, x : x + w]
-        proc = self._preprocess(crop)
+        crop_primary = frame[y : y + h, x : x + w]
+        # Prepare alternate, slightly narrower ROI to reduce noise and glare
+        x2 = x + int(0.05 * w)
+        w2 = int(0.90 * w)
+        crop_alt = frame[y : y + h, x2 : x2 + w2]
 
-        # Bias OCR to characters we expect in the scoreboard line
+        # OCR config biased to scoreboard characters
         ocr_cfg = "--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:"
-        text = pytesseract.image_to_string(proc, config=ocr_cfg)
+
+        def parse_text_from_crop(crop_img: np.ndarray) -> Tuple[Optional[int], Optional[int]]:
+            proc = self._preprocess(crop_img)
+            text = pytesseract.image_to_string(proc, config=ocr_cfg) or ""
+            # Try inverted in case of light-on-dark variations
+            if not text.strip():
+                inv = cv2.bitwise_not(proc)
+                text = pytesseract.image_to_string(inv, config=ocr_cfg) or ""
+            rn: Optional[int] = None
+            ts: Optional[int] = None
+            m = self._ROUND_RE.search(text)
+            if m:
+                try:
+                    rn = int(m.group(1))
+                except ValueError:
+                    rn = None
+            m = self._TIME_RE.search(text)
+            if m:
+                try:
+                    minutes = int(m.group(1))
+                    seconds = int(m.group(2))
+                    ts = minutes * 60 + seconds
+                except ValueError:
+                    ts = None
+            return rn, ts
 
         round_number: Optional[int] = None
         time_seconds: Optional[int] = None
+
+        # Attempt parse using primary then alternate crop
+        for crop_try in (crop_primary, crop_alt):
+            rn, ts = parse_text_from_crop(crop_try)
+            # Keep the best values seen so far
+            if round_number is None and rn is not None:
+                round_number = rn
+            if time_seconds is None and ts is not None:
+                time_seconds = ts
+            if round_number is not None and time_seconds is not None:
+                break
+
+        # Spike planted detection on primary crop
         bomb_planted: bool = False
-
-        # Round number
-        m = self._ROUND_RE.search(text)
-        if m:
-            try:
-                round_number = int(m.group(1))
-            except ValueError:
-                round_number = None
-
-        # Time
-        m = self._TIME_RE.search(text)
-        if m:
-            try:
-                minutes = int(m.group(1))
-                seconds = int(m.group(2))
-                time_seconds = minutes * 60 + seconds
-            except ValueError:
-                time_seconds = None
-
-        # Spike planted detection
-        # (1) Template matching if spike template available
         if SPIKE_TEMPLATE is not None:
-            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            gray_crop = cv2.cvtColor(crop_primary, cv2.COLOR_BGR2GRAY)
             if (
                 gray_crop.shape[0] >= SPIKE_TEMPLATE.shape[0]
                 and gray_crop.shape[1] >= SPIKE_TEMPLATE.shape[1]
@@ -116,10 +138,8 @@ class ScoreboardDetector:
                 res = cv2.matchTemplate(gray_crop, SPIKE_TEMPLATE, cv2.TM_CCOEFF_NORMED)
                 _, max_val, _, _ = cv2.minMaxLoc(res)
                 bomb_planted = max_val >= SPIKE_TM_THRESHOLD
-
-        # (2) Fallback colour heuristic
         if not bomb_planted:
-            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            hsv = cv2.cvtColor(crop_primary, cv2.COLOR_BGR2HSV)
             lower = np.array([150, 100, 100])
             upper = np.array([180, 255, 255])
             mask = cv2.inRange(hsv, lower, upper)

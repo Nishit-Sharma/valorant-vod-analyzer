@@ -21,7 +21,13 @@ export default function AnalysisPage() {
   const [mask, setMask] = React.useState({});
   const [conclusions, setConclusions] = React.useState({ roundSummaries: [], strategicConclusions: [] });
   const [ts, setTs] = React.useState(0);
-  const [filters, setFilters] = React.useState({ teams: new Set(["Ally","Enemy"]), eventTypes: new Set(["agent_detection","spike_planted","kill","ability_cast"]) });
+  const [filters, setFilters] = React.useState({
+    teams: new Set(["Ally","Enemy"]),
+    eventTypes: new Set(["agent_detection","spike_planted","kill","ability_cast"]),
+    methods: new Set(["yolo","template"]),
+    minConfidence: 0,
+    heatmap: false
+  });
 
   React.useEffect(() => {
     if (!id) return;
@@ -46,7 +52,33 @@ export default function AnalysisPage() {
   if (!id) return null;
   const events = analysis?.events || [];
   const rounds = groupByRound(events);
-  const currentPoints = pointsAt(events, ts, 300).filter((p)=>filters.teams.has(p.team));
+  const currentPoints = React.useMemo(()=>{
+    const pts = pointsAt(events, ts, 300);
+    return pts.filter((p)=>{
+      if (!filters.teams.has(p.team)) return false;
+      if (filters.methods && filters.methods.size && !filters.methods.has(p.method)) return false;
+      if (typeof filters.minConfidence === "number" && (p.confidence ?? 0) < filters.minConfidence) return false;
+      return true;
+    });
+  }, [events, ts, filters]);
+  const heatmapPoints = React.useMemo(()=>{
+    const out = [];
+    for (const e of events || []) {
+      if (e.event_type !== "agent_detection") continue;
+      const d = e.details || {};
+      const cx = typeof d.center_x === "number" ? d.center_x : (Array.isArray(d.bbox) && d.bbox.length>=4 ? (d.bbox[0]+d.bbox[2])/2 : null);
+      const cy = typeof d.center_y === "number" ? d.center_y : (Array.isArray(d.bbox) && d.bbox.length>=4 ? (d.bbox[1]+d.bbox[3])/2 : null);
+      if (cx == null || cy == null) continue;
+      const team = (d.class_name && d.class_name.startsWith("Ally_")) ? "Ally" : ((d.class_name && d.class_name.startsWith("Enemy_")) ? "Enemy" : "Unknown");
+      if (!filters.teams.has(team)) continue;
+      const method = e.detection_method || (d.template ? "template" : "yolo");
+      if (filters.methods && filters.methods.size && !filters.methods.has(method)) continue;
+      const conf = typeof e.confidence === "number" ? e.confidence : 0;
+      if (typeof filters.minConfidence === "number" && conf < filters.minConfidence) continue;
+      out.push({ x: cx, y: cy, team, method, label: d.class_name || d.template || "Detection", confidence: conf });
+    }
+    return out;
+  }, [events, filters]);
   const stats = { events: events.length, agents: agentsCount(events), duration: analysis?.meta?.durationMs || 0 };
   const mapName = analysis?.meta?.map || null;
 
@@ -79,7 +111,7 @@ export default function AnalysisPage() {
           </aside>
           <section className="order-2 card p-3 rounded">
             <div className="mb-2 text-sm text-gray-300">{mapName || "Unknown map"}</div>
-            <MinimapCanvas mask={mask} points={currentPoints} width={500} height={528} />
+            <MinimapCanvas mask={mask} points={currentPoints} heatmap={!!filters.heatmap} heatmapPoints={heatmapPoints} width={500} height={528} />
             {Object.keys(mask||{}).length===0 ? (
               <div className="text-xs text-yellow-300 bg-yellow-900/30 border border-yellow-700 rounded p-2 mt-2">No mask loaded. Supply site_masks/&lt;map&gt;.json to see polygons.</div>
             ): null}

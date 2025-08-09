@@ -61,7 +61,8 @@ export function pointsAt(events, ts, windowMs = 300) {
       const team = teamFromClassName(e.details && e.details.class_name) || "Unknown";
       const method = e.detection_method || (e.details && e.details.template ? "template" : "yolo");
       const label = (e.details && (e.details.class_name || e.details.category || e.details.template)) || "Detection";
-      res.push({ x: c.x, y: c.y, team, method, label });
+      const confidence = typeof e.confidence === "number" ? e.confidence : 0;
+      res.push({ x: c.x, y: c.y, team, method, label, confidence });
     }
   }
   return res;

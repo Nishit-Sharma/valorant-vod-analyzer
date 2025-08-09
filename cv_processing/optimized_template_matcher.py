@@ -146,6 +146,44 @@ class OptimizedValorantTemplateDetector:
         
         return frame[y1:y2, x1:x2], (x1, y1)
     
+    def _roi_activity_score(self, roi_frame: np.ndarray) -> float:
+        """Compute a very cheap activity score for an ROI to decide whether to scan templates.
+        
+        Uses grayscale standard deviation and edge density.
+        """
+        if roi_frame is None or roi_frame.size == 0:
+            return 0.0
+        if len(roi_frame.shape) == 3:
+            gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = roi_frame
+        std = float(np.std(gray))
+        # Cheap edge count
+        edges = cv2.Canny(gray, 80, 160)
+        edge_density = float(np.count_nonzero(edges)) / max(1, edges.size)
+        # Weighted combination
+        return std * 0.8 + edge_density * 100.0
+    
+    def _should_scan_category(self, category: str, roi_frame: np.ndarray) -> bool:
+        """Short-circuit category scan if the ROI looks inactive (flat).
+        
+        Thresholds are intentionally conservative to avoid skipping valid matches.
+        """
+        score = self._roi_activity_score(roi_frame)
+        # Baselines chosen empirically for broadcast overlays
+        if category in ("weapons", "ui_elements"):
+            # Killfeed area often very flat between events
+            return score >= 12.0
+        if category == "abilities":
+            return score >= 10.0
+        if category == "agents":
+            # Scoreboard strip: usually has some texture
+            return score >= 6.0
+        if category == "game_states":
+            # Full-screen templates like replay/spike banners
+            return score >= 8.0
+        return True
+    
     def _match_template_optimized(self, image: np.ndarray, template_data: Dict, 
                                 threshold: float) -> Tuple[float, Tuple[int, int], float]:
         """Optimized template matching using preprocessed templates"""
@@ -234,6 +272,14 @@ class OptimizedValorantTemplateDetector:
             # Choose appropriate ROI based on category
             roi_name = self._get_roi_for_category(category)
             roi_frame, roi_offset = self._get_roi(frame, roi_name)
+            
+            # Short-circuit: Skip scanning this category if ROI is inactive
+            try:
+                if not self._should_scan_category(category, roi_frame):
+                    continue
+            except Exception:
+                # Fail open
+                pass
             
             # Process templates for this category
             category_matches = self._process_category_parallel(
@@ -366,7 +412,7 @@ class OptimizedValorantTemplateDetector:
             return "ability_cast"
         elif category == "game_states":
             if "spike" in template_name.lower():
-                return "spike_plant"
+                return "spike_planted"
             elif "defus" in template_name.lower():
                 return "spike_defuse"
         

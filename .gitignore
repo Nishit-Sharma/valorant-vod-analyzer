@@ -7,3 +7,5 @@ ffprobe.exe
 .vscode/*
 .cursor/*
 /data/MKOI vs FNC - VCT EMEA 2025 Stage 2 - W2 D3 - Map 1
+website/.env.local
+.env

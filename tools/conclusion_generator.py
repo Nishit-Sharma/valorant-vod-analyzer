@@ -50,7 +50,7 @@ def _canonical_site(name: str) -> str:
     if "garden" in n:
         return "Garden"
     if "mid" in n:
-        return "Middle"
+        return "Mid"
     return name
 
 
@@ -202,44 +202,78 @@ def _events_by_ts(events: List[Dict]) -> Dict[int, List[Dict]]:
     return by
 
 
-def _location_of_team(frame_events: List[Dict], team_label: str) -> str:
-    pts = [
-        (ev["details"].get("center_x"), ev["details"].get("center_y"))
-        for ev in frame_events
-        if team_label in ev.get("details", {}).get("class_name", "")
-           and ev.get("details") is not None
-           and ev["details"].get("center_x") is not None
-           and ev["details"].get("center_y") is not None
-    ]
-    if not pts:
-        return ""
-    avg_x = float(np.mean([p[0] for p in pts]))
-    avg_y = float(np.mean([p[1] for p in pts]))
-    return loc_from_point(avg_x, avg_y)
+def _event_location(ev: Dict) -> str:
+    try:
+        det = ev.get("details", {})
+        # Prefer detector-provided location when available
+        if isinstance(det, dict) and det.get("location"):
+            return _canonical_site(det.get("location"))
+        cx = det.get("center_x"); cy = det.get("center_y")
+        if cx is None or cy is None:
+            return "Unknown"
+        return _canonical_site(loc_from_point(float(cx), float(cy)))
+    except Exception:
+        return "Unknown"
 
 
 def _top_locations(frames: List[List[Dict]], team_label: str, max_items: int = 2, min_conf: float = 0.6) -> str:
     if not frames:
         return "unknown"
+    SPAWNS = {"CT Spawn", "T Spawn"}
     counts: Dict[str, int] = {}
-    total = 0
+    total_count = 0
+    had_any = False
     for fe in frames:
-        loc = _location_of_team(fe, team_label)
-        if not loc:
-                    continue
-        counts[loc] = counts.get(loc, 0) + 1
-        total += 1
-    if total == 0:
+        # Collect per-frame locations for the specified team
+        frame_locs = []
+        for ev in fe:
+            det = ev.get("details", {})
+            if team_label in det.get("class_name", ""):
+                loc = _event_location(ev)
+                if loc and loc != "Unknown":
+                    frame_locs.append(loc)
+        if not frame_locs:
+            continue
+        had_any = True
+        # Suppress spawn locations if other regions exist in the same frame
+        non_spawn = [l for l in frame_locs if l not in SPAWNS]
+        chosen = non_spawn if non_spawn else frame_locs
+        for loc in chosen:
+            counts[loc] = counts.get(loc, 0) + 1
+            total_count += 1
+    if not had_any:
         return "unknown"
-    # Sort by frequency
+    if not counts:
+        return "spread out"
+    # If we have any non-spawn counts overall, drop spawns entirely from tally
+    if any(loc not in SPAWNS for loc in counts.keys()):
+        counts = {k: v for k, v in counts.items() if k not in SPAWNS}
+        total_count = sum(counts.values()) or total_count
+    if not counts:
+        return "spread out"
     items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
     top_name, top_count = items[0]
-    conf = top_count / total
-    if conf >= min_conf:
+    conf1 = (top_count / total_count) if total_count else 0.0
+    if conf1 >= min_conf:
         return top_name
-    # Otherwise list up to two top locations
-    names = [n for n, _ in items[:max_items]]
-    return " and ".join(names) if names else "spread out"
+    # Consider top-2 if they represent a strong dual-mode clustering
+    if len(items) >= 2:
+        second_name, second_count = items[1]
+        conf2 = second_count / total_count
+        if (conf1 + conf2) >= 0.7 and conf2 >= 0.2:
+            return f"{top_name} and {second_name}"
+    return "spread out"
+
+
+def _format_loc(loc: str) -> str:
+    if not loc:
+        return "unknown"
+    # Normalization for display
+    if loc.lower() == "middle":
+        return "Mid"
+    if loc.lower() == "unknown":
+        return "spread out"
+    return loc
 
 
 def summarize_rounds(events: List[Dict]) -> List[str]:
@@ -255,12 +289,12 @@ def summarize_rounds(events: List[Dict]) -> List[str]:
             rel = ts - start
             bins[get_time_bin_ms(rel)].append(frame_events)
         # Top locations per bucket
-        atk_e = _top_locations(bins["early_round"], "Enemy")
-        dfn_e = _top_locations(bins["early_round"], "Ally")
-        atk_m = _top_locations(bins["mid_round"], "Enemy")
-        dfn_m = _top_locations(bins["mid_round"], "Ally")
-        atk_l = _top_locations(bins["late_round"], "Enemy")
-        dfn_l = _top_locations(bins["late_round"], "Ally")
+        atk_e = _format_loc(_top_locations(bins["early_round"], "Enemy"))
+        dfn_e = _format_loc(_top_locations(bins["early_round"], "Ally"))
+        atk_m = _format_loc(_top_locations(bins["mid_round"], "Enemy"))
+        dfn_m = _format_loc(_top_locations(bins["mid_round"], "Ally"))
+        atk_l = _format_loc(_top_locations(bins["late_round"], "Enemy"))
+        dfn_l = _format_loc(_top_locations(bins["late_round"], "Ally"))
 
         # Spike site (prefer explicit A/B based on nearby site detections)
         site_letter = None  # 'A' or 'B'
@@ -270,12 +304,10 @@ def summarize_rounds(events: List[Dict]) -> List[str]:
             a_hits = 0
             b_hits = 0
             for ts, frame_events in by_ts.items():
-                if abs(ts - spk) <= 5_000:
+                if abs(ts - spk) <= 8_000:
                     for ev in frame_events:
-                        cx = ev["details"].get("center_x"); cy = ev["details"].get("center_y")
-                        if cx is None or cy is None:
-                            continue
-                        loc = loc_from_point(cx, cy)
+                        det = ev.get("details", {})
+                        loc = _canonical_site(det.get("location")) if det.get("location") else loc_from_point(det.get("center_x"), det.get("center_y"))
                         if loc == "A Site":
                             a_hits += 1
                         elif loc == "B Site":
@@ -326,13 +358,26 @@ def analyze_positions(events: List[Dict]) -> Dict[str, Dict[str, Dict[str, List[
             if sites:
                 dest = max(set(sites), key=sites.count)
         # Aggregate per time bin and team
+        SPAWNS = {"CT Spawn", "T Spawn"}
         for ts, frame_events in by_ts.items():
             tb = get_time_bin_ms(ts - start)
             for team in ("Enemy", "Ally"):
-                loc = _location_of_team(frame_events, team)
-                if loc:
-                    side = "Attackers" if (team == "Enemy" and r["round"] <= 12) or (team == "Ally" and r["round"] > 12) else "Defenders"
-                    patterns[f"{team}-{side}"][tb][loc].append(dest)
+                # Choose a representative location for this frame and team
+                frame_locs = []
+                for ev in frame_events:
+                    det = ev.get("details", {})
+                    if team in det.get("class_name", ""):
+                        loc = _event_location(ev)
+                        if loc and loc != "Unknown":
+                            frame_locs.append(loc)
+                if not frame_locs:
+                    continue
+                non_spawn = [l for l in frame_locs if l not in SPAWNS]
+                chosen_list = non_spawn if non_spawn else frame_locs
+                # Use the most frequent location in this frame
+                chosen = max(set(chosen_list), key=chosen_list.count)
+                side = "Attackers" if (team == "Enemy" and r["round"] <= 12) or (team == "Ally" and r["round"] > 12) else "Defenders"
+                patterns[f"{team}-{side}"][tb][chosen].append(dest)
     return patterns
 
 

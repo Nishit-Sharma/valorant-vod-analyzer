@@ -8,6 +8,12 @@ export default function EventsTable({ events = [], onSelect = () => {}, filters 
     for (const e of events) {
       const type = e.event_type || "other";
       if (filters.eventTypes && !filters.eventTypes.has(type)) continue;
+      // Method filter
+      const method = (e.detection_method || (e.details && e.details.template ? "template" : "yolo"));
+      if (filters.methods && filters.methods.size && !filters.methods.has(method)) continue;
+      // Confidence filter
+      const conf = typeof e.confidence === "number" ? e.confidence : 0;
+      if (typeof filters.minConfidence === "number" && conf < filters.minConfidence) continue;
       if (!m.has(type)) m.set(type, []);
       m.get(type).push(e);
     }

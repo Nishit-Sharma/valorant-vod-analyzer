@@ -511,7 +511,7 @@ class HybridGameEventExtractor:
             return "ability_cast"
         elif category == "game_states":
             if "spike" in template_name.lower():
-                return "spike_plant"
+                return "spike_planted"
             elif "defus" in template_name.lower():
                 return "spike_defuse"
         elif category == "agents":
@@ -531,8 +531,15 @@ class HybridGameEventExtractor:
         last_event_time = {}
         
         for event in events:
-            details_key = event['details'].get('class_name') if isinstance(event.get('details'), dict) else None
-            key = f"{event['event_type']}_{details_key}"
+            details = event.get('details') if isinstance(event.get('details'), dict) else {}
+            # Prefer most specific identifier available for template and yolo events
+            identity = (
+                details.get('class_name')
+                or details.get('template')
+                or details.get('category')
+                or "unknown"
+            )
+            key = f"{event.get('event_type','unknown')}::{identity}"
             
             if (key not in last_event_time or 
                 event["timestamp_ms"] - last_event_time[key] > time_window_ms):

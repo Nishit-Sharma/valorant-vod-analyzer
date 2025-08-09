@@ -15,7 +15,7 @@ function drawDiamond(ctx, x, y, r, color) {
   ctx.restore();
 }
 
-export default function MinimapCanvas({ mask = {}, points = [], width = 335, height = 354 }) {
+export default function MinimapCanvas({ mask = {}, points = [], heatmap = false, heatmapPoints = [], width = 335, height = 354 }) {
   const canvasRef = React.useRef(null);
   const [hoverLabel, setHoverLabel] = React.useState(null);
   const [mousePos, setMousePos] = React.useState({ x: 0, y: 0 });
@@ -44,6 +44,32 @@ export default function MinimapCanvas({ mask = {}, points = [], width = 335, hei
       ctx.closePath();
       ctx.stroke();
     }
+    // Heatmap layer (optional)
+    if (heatmap && Array.isArray(heatmapPoints) && heatmapPoints.length) {
+      const cell = Math.max(8, Math.floor(Math.min(width, height) / 24));
+      const cols = Math.ceil(width / cell);
+      const rows = Math.ceil(height / cell);
+      const grid = new Array(rows * cols).fill(0);
+      let maxVal = 0;
+      for (const p of heatmapPoints) {
+        const sp = scalePoint({ x: p.x, y: p.y }, width, height);
+        const gx = Math.max(0, Math.min(cols - 1, Math.floor(sp.x / cell)));
+        const gy = Math.max(0, Math.min(rows - 1, Math.floor(sp.y / cell)));
+        const idx = gy * cols + gx;
+        grid[idx] += 1;
+        if (grid[idx] > maxVal) maxVal = grid[idx];
+      }
+      // Draw grid with alpha scaled by density
+      for (let gy = 0; gy < rows; gy++) {
+        for (let gx = 0; gx < cols; gx++) {
+          const v = grid[gy * cols + gx];
+          if (!v) continue;
+          const a = Math.min(0.8, (v / (maxVal || 1)) * 0.8);
+          ctx.fillStyle = `rgba(234, 88, 12, ${a})`; // orange heat
+          ctx.fillRect(gx * cell, gy * cell, cell, cell);
+        }
+      }
+    }
     for (const p of points) {
       const sp = scalePoint({ x: p.x, y: p.y }, width, height);
       const color = TEAM_COLORS[p.team] || TEAM_COLORS.Unknown;
@@ -58,7 +84,7 @@ export default function MinimapCanvas({ mask = {}, points = [], width = 335, hei
       ctx.font = "10px sans-serif";
       ctx.fillText(p.label || "", sp.x + 6, sp.y - 6);
     }
-  }, [scaledPolys, points, width, height]);
+  }, [scaledPolys, points, heatmap, heatmapPoints, width, height]);
 
   function handleMouseMove(e) {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -83,6 +109,7 @@ export default function MinimapCanvas({ mask = {}, points = [], width = 335, hei
         <div className="flex items-center gap-1 text-xs"><span className="inline-block w-3 h-3 rounded-full" style={{ backgroundColor: TEAM_COLORS.Enemy }} />Enemy</div>
         <div className="flex items-center gap-1 text-xs"><span className="inline-block w-3 h-3 rotate-45 bg-gray-600" style={{ width: 8, height: 8 }} />Template</div>
         <div className="flex items-center gap-1 text-xs"><span className="inline-block w-3 h-3 rounded-full bg-gray-600" />YOLO</div>
+        {heatmap ? <div className="flex items-center gap-1 text-xs"><span className="inline-block w-3 h-3 bg-orange-500/70" />Heatmap</div> : null}
       </div>
     </div>
   );

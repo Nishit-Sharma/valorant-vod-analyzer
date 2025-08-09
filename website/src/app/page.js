@@ -37,7 +37,7 @@ export default function Home() {
       <main className="max-w-6xl mx-auto p-6">
         <div className="flex items-center justify-between mb-4">
           <h1 className="text-2xl font-semibold">Analysis</h1>
-          <Link href="/upload" className="px-3 py-2 rounded btn text-sm">Upload Analysis</Link>
+          <Link href="/upload" className="px-3 py-2 rounded btn text-sm">Run Analysis</Link>
         </div>
         <div className="flex gap-3 mb-6">
           <input
